@@ -354,6 +354,7 @@ class AbletonMCP(ControlSurface):
                                  "set_metronome", "set_count_in",
                                  "set_record_quantization", "set_time_signature",
                                  "set_session_record", "set_punch_region",
+                                 "set_record_mode",
                                  "tap_tempo", "bump_tempo",
                                  # Scenes batch (2026-05-17)
                                  "create_scene", "delete_scene",
@@ -368,7 +369,10 @@ class AbletonMCP(ControlSurface):
                                  "set_clip_follow_action",
                                  # Warp markers (2026-05-17)
                                  "add_warp_marker", "remove_warp_marker",
-                                 "move_warp_marker"]:
+                                 "move_warp_marker",
+                                 # Arrangement-clip writer (2026-05-19)
+                                 "create_arrangement_clip_from_session",
+                                 "set_arrangement_clip_position"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -681,6 +685,9 @@ class AbletonMCP(ControlSurface):
                                 punch_in=params.get("punch_in"),
                                 punch_out=params.get("punch_out"),
                             )
+                        elif command_type == "set_record_mode":
+                            result = self._set_record_mode(
+                                enabled=params.get("enabled", False))
                         elif command_type == "tap_tempo":
                             result = self._tap_tempo()
                         elif command_type == "bump_tempo":
@@ -778,6 +785,18 @@ class AbletonMCP(ControlSurface):
                                 params.get("clip_index", 0),
                                 params.get("beat_time", 0.0),
                                 params.get("new_beat_time", 0.0))
+                        elif command_type == "create_arrangement_clip_from_session":
+                            result = self._create_arrangement_clip_from_session(
+                                params.get("track_index", 0),
+                                params.get("source_clip_slot", 0),
+                                params.get("start_beat", 0.0),
+                                params.get("length_beats"))
+                        elif command_type == "set_arrangement_clip_position":
+                            result = self._set_arrangement_clip_position(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("new_start_beat"),
+                                params.get("new_length"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1776,6 +1795,188 @@ class AbletonMCP(ControlSurface):
             return info
         except Exception as e:
             self.log_message("Error deleting arrangement clip: " + str(e))
+            raise
+
+    def _create_arrangement_clip_from_session(self, track_index, source_clip_slot,
+                                                start_beat, length_beats=None):
+        """Place a session-view clip onto the arrangement timeline at start_beat.
+
+        For MIDI: reads notes from the source session clip and writes them into
+        a new arrangement MIDI clip via Live's Track.create_midi_clip.
+        For audio: reads the source clip's file_path and uses
+        Track.create_audio_clip to reference the same sample.
+
+        If length_beats is None, defaults to the source clip's length.
+        For MIDI clips longer than source, the source's notes are placed
+        once (no looping). For audio clips, Live's natural loop semantics apply.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if source_clip_slot < 0 or source_clip_slot >= len(track.clip_slots):
+                raise IndexError("Source clip slot out of range")
+            src_slot = track.clip_slots[source_clip_slot]
+            if not src_slot.has_clip:
+                raise Exception("Source clip slot is empty")
+            src_clip = src_slot.clip
+            start_beat = float(start_beat)
+            if length_beats is None:
+                length_beats = float(src_clip.length)
+            else:
+                length_beats = float(length_beats)
+            if length_beats <= 0:
+                raise ValueError("length_beats must be > 0")
+            end_beat = start_beat + length_beats
+            new_clip = None
+            if src_clip.is_midi_clip:
+                # Live 12.3.7: Track.create_midi_clip(start_time, length).
+                # Verified empirically 2026-05-19 — passing (200, 232) gave
+                # length=232 not length=32, so 2nd arg is LENGTH (not end_time
+                # as one might expect from docs).
+                new_clip = track.create_midi_clip(start_beat, length_beats)
+                # Copy notes via old-API set_notes (most reliable on Live 12.3.7;
+                # mirrors the convention used by _add_notes_to_clip).
+                try:
+                    src_notes = src_clip.get_notes(0, 0, src_clip.length, 128)
+                    if src_notes:
+                        new_clip.set_notes(tuple(src_notes))
+                except Exception as note_err:
+                    self.log_message(
+                        "Warning: note copy failed: " + str(note_err))
+            else:
+                # Audio source: replicate via file_path + create_audio_clip
+                file_path = getattr(src_clip, "file_path", None) or getattr(
+                    src_clip, "sample_path", None)
+                if not file_path:
+                    raise Exception(
+                        "Source audio clip has no file_path — cannot replicate")
+                new_clip = track.create_audio_clip(file_path, start_beat)
+                # create_audio_clip ignores length; set explicit end via clip.end_marker
+                try:
+                    new_clip.end_marker = end_beat
+                except Exception:
+                    pass
+            return {
+                "track_index": track_index,
+                "source_clip_slot": source_clip_slot,
+                "start_beat": start_beat,
+                "length_beats": length_beats,
+                "is_midi_clip": bool(src_clip.is_midi_clip),
+                "new_clip_name": getattr(new_clip, "name", "") if new_clip else "",
+            }
+        except Exception as e:
+            self.log_message("Error creating arrangement clip: " + str(e))
+            raise
+
+    def _set_arrangement_clip_position(self, track_index, clip_index,
+                                         new_start_beat=None, new_length=None):
+        """Move and/or resize an arrangement clip via delete-and-recreate.
+
+        Live 12.3.7 LOM does NOT expose Clip.start_time as a setter on
+        arrangement clips (read-only), and Track.move_clip is not available.
+        Setting Clip.end_marker hangs the main thread without effect. The only
+        reliable way to mutate an arrangement clip's position/length is to
+        capture its content, delete it, and create a new clip at the target.
+
+        - new_start_beat: target start position (omit to keep current)
+        - new_length: target clip length in beats (omit to keep current)
+
+        Returns the new effective clip_index (it may shift since the recreated
+        clip lands at the end of arrangement_clips).
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            clips = getattr(track, "arrangement_clips", None) or ()
+            if clip_index < 0 or clip_index >= len(clips):
+                raise IndexError(
+                    "Arrangement clip index out of range (0..{0})".format(
+                        len(clips) - 1))
+            clip = clips[clip_index]
+
+            # Capture current state
+            cur_start = float(clip.start_time)
+            cur_length = float(clip.length)
+            is_midi = bool(clip.is_midi_clip)
+            cur_name = clip.name
+
+            # Resolve targets
+            target_start = (
+                float(new_start_beat) if new_start_beat is not None else cur_start)
+            target_length = (
+                float(new_length) if new_length is not None else cur_length)
+            if target_start < 0:
+                raise ValueError("new_start_beat must be >= 0")
+            if target_length <= 0:
+                raise ValueError("new_length must be > 0")
+            if (new_start_beat is None) and (new_length is None):
+                raise ValueError(
+                    "No change requested (pass new_start_beat and/or new_length)")
+
+            # Capture content BEFORE deletion
+            captured_notes = None
+            file_path = None
+            if is_midi:
+                try:
+                    captured_notes = clip.get_notes(0, 0, cur_length, 128)
+                except Exception as e:
+                    raise Exception("Cannot read MIDI notes: {0}".format(e))
+            else:
+                file_path = (getattr(clip, "file_path", None) or
+                             getattr(clip, "sample_path", None))
+                if not file_path:
+                    raise Exception(
+                        "Audio clip has no file_path — cannot replicate")
+
+            # Delete the existing arrangement clip
+            track.delete_clip(clip)
+
+            # Recreate at target position with target length
+            if is_midi:
+                new_clip = track.create_midi_clip(target_start, target_length)
+                if captured_notes:
+                    try:
+                        new_clip.set_notes(tuple(captured_notes))
+                    except Exception as ne:
+                        self.log_message(
+                            "Warning: note copy failed: " + str(ne))
+            else:
+                new_clip = track.create_audio_clip(file_path, target_start)
+                try:
+                    new_clip.end_marker = target_start + target_length
+                except Exception:
+                    pass
+
+            # Preserve name if any
+            if cur_name:
+                try:
+                    new_clip.name = cur_name
+                except Exception:
+                    pass
+
+            # Locate new clip's index in arrangement_clips (search by start_time)
+            new_clips = track.arrangement_clips
+            new_idx = -1
+            for i, c in enumerate(new_clips):
+                if abs(float(c.start_time) - target_start) < 0.0001:
+                    new_idx = i
+                    break
+
+            return {
+                "track_index": track_index,
+                "old_clip_index": clip_index,
+                "new_clip_index": new_idx,
+                "old_start": cur_start,
+                "old_length": cur_length,
+                "new_start": float(new_clip.start_time),
+                "new_length": float(new_clip.length),
+                "is_midi_clip": is_midi,
+                "note": "Implemented via delete+recreate — Live LOM read-only on arrangement clip position/length",
+            }
+        except Exception as e:
+            self.log_message("Error setting arrangement clip position: " + str(e))
             raise
 
     def _set_clip_loop_region(self, track_index, clip_index, loop_start, loop_end):
@@ -4387,6 +4588,7 @@ class AbletonMCP(ControlSurface):
                 "swing_amount": self._safe_get(song, "swing_amount"),
                 "signature_numerator": song.signature_numerator,
                 "signature_denominator": song.signature_denominator,
+                "record_mode": self._safe_get(song, "record_mode", bool),
                 "session_record": self._safe_get(song, "session_record", bool),
                 "arrangement_overdub": self._safe_get(song, "arrangement_overdub", bool),
                 "back_to_arranger": self._safe_get(song, "back_to_arranger", bool),
@@ -4501,6 +4703,20 @@ class AbletonMCP(ControlSurface):
             return {"changed": changed}
         except Exception as e:
             self.log_message("Error setting session record: " + str(e))
+            raise
+
+    def _set_record_mode(self, enabled):
+        """Toggle Song.record_mode (the global arrangement record button).
+
+        When True + playback is started, Live captures session-view firings
+        onto the arrangement timeline (the standard session→arrangement
+        record workflow).
+        """
+        try:
+            self._song.record_mode = bool(enabled)
+            return {"record_mode": bool(self._song.record_mode)}
+        except Exception as e:
+            self.log_message("Error setting record_mode: " + str(e))
             raise
 
     def _set_punch_region(self, punch_in=None, punch_out=None):

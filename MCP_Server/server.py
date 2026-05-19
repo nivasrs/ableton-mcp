@@ -137,7 +137,9 @@ class AbletonConnection:
             # Transport batch (2026-05-17)
             "set_metronome", "set_count_in",
             "set_record_quantization", "set_time_signature",
-            "set_session_record", "set_punch_region",
+            "set_session_record", "set_punch_region", "set_record_mode",
+            "create_arrangement_clip_from_session",
+            "set_arrangement_clip_position",
             "tap_tempo", "bump_tempo",
             # Scenes batch (2026-05-17)
             "create_scene", "delete_scene", "duplicate_scene",
@@ -2656,6 +2658,112 @@ def set_punch_region(
     except Exception as e:
         logger.error(f"Error setting punch region: {e}")
         return f"Error setting punch region: {e}"
+
+
+@mcp.tool()
+def create_arrangement_clip_from_session(
+    ctx: Context,
+    track_index: int,
+    source_clip_slot: int,
+    start_beat: float,
+    length_beats: float = None,
+) -> str:
+    """
+    Place a session-view clip directly onto the arrangement timeline at
+    start_beat — no record/playback needed. Bar-precise placement.
+
+    Use when Live is open + you want to build/edit arrangement view
+    programmatically without the lossy session→arrangement record dance.
+
+    For MIDI source clips: notes are copied from the session clip into a new
+    arrangement MIDI clip (via Track.create_midi_clip + set_notes).
+    For audio source clips: the new arrangement clip references the same
+    underlying sample file (via Track.create_audio_clip).
+
+    Parameters:
+    - track_index: target track (same track that contains the source clip)
+    - source_clip_slot: index of the session clip slot to copy from
+    - start_beat: arrangement timeline position (0 = song start)
+    - length_beats: target arrangement clip length. If omitted, uses
+                    source clip's length. For MIDI, notes are placed once
+                    (no internal loop). For audio, Live's loop semantics apply.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {
+            "track_index": track_index,
+            "source_clip_slot": source_clip_slot,
+            "start_beat": start_beat,
+        }
+        if length_beats is not None:
+            params["length_beats"] = length_beats
+        result = ableton.send_command("create_arrangement_clip_from_session", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error creating arrangement clip: {e}")
+        return f"Error creating arrangement clip: {e}"
+
+
+@mcp.tool()
+def set_arrangement_clip_position(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    new_start_beat: float = None,
+    new_length: float = None,
+) -> str:
+    """
+    Move and/or resize an existing arrangement clip in place.
+
+    Pair this with `get_arrangement_clips` to locate the clip's position-in-tuple,
+    and `create_arrangement_clip_from_session` for fresh placements. Together
+    these unlock most arrangement-view editing while Live is open (without the
+    session→arrangement record dance).
+
+    Parameters:
+    - track_index: index of the track holding the arrangement clip
+    - clip_index: position in track.arrangement_clips (from get_arrangement_clips)
+    - new_start_beat: target arrangement timeline start (omit to keep current)
+    - new_length: target clip length in beats (omit to keep current)
+
+    Implementation order: resize first, then move — avoids spurious overlap
+    rejections from Live. Returns the post-write start/end/length.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {"track_index": track_index, "clip_index": clip_index}
+        if new_start_beat is not None:
+            params["new_start_beat"] = new_start_beat
+        if new_length is not None:
+            params["new_length"] = new_length
+        if "new_start_beat" not in params and "new_length" not in params:
+            return "Error: provide at least one of new_start_beat / new_length"
+        result = ableton.send_command("set_arrangement_clip_position", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting arrangement clip position: {e}")
+        return f"Error setting arrangement clip position: {e}"
+
+
+@mcp.tool()
+def set_record_mode(ctx: Context, enabled: bool) -> str:
+    """
+    Toggle Live's global arrangement record button (Song.record_mode).
+
+    When True + playback is started, Live captures session-view clip
+    firings onto the arrangement timeline (the standard
+    session→arrangement record workflow).
+
+    Parameters:
+    - enabled: True to arm arrangement record, False to disable
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_record_mode", {"enabled": bool(enabled)})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting record_mode: {e}")
+        return f"Error setting record_mode: {e}"
 
 
 @mcp.tool()
