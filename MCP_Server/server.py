@@ -140,6 +140,8 @@ class AbletonConnection:
             "set_session_record", "set_punch_region", "set_record_mode",
             "create_arrangement_clip_from_session",
             "set_arrangement_clip_position",
+            "set_device_input_routing",
+            "snap_clip_to_scale", "shape_clip_velocities", "set_cue_point_name",
             "tap_tempo", "bump_tempo",
             # Scenes batch (2026-05-17)
             "create_scene", "delete_scene", "duplicate_scene",
@@ -2702,6 +2704,177 @@ def create_arrangement_clip_from_session(
     except Exception as e:
         logger.error(f"Error creating arrangement clip: {e}")
         return f"Error creating arrangement clip: {e}"
+
+
+@mcp.tool()
+def snap_clip_to_scale(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    root_note: int,
+    scale_name: str = "Minor",
+    strategy: str = "nearest",
+) -> str:
+    """
+    Pitch-snap every note in a MIDI clip to the target scale.
+
+    Scales: Major / Minor / Natural Minor / Harmonic Minor / Melodic Minor /
+            Dorian / Phrygian / Lydian / Mixolydian / Locrian /
+            Pentatonic Major / Pentatonic Minor / Blues / Chromatic.
+
+    Parameters:
+    - track_index, clip_index: target MIDI clip (session view)
+    - root_note: 0 (C) .. 11 (B) — same convention as Live's Song.root_note
+    - scale_name: see list above
+    - strategy: 'nearest' (default, ties up) | 'up' | 'down'
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("snap_clip_to_scale", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "root_note": int(root_note),
+            "scale_name": scale_name,
+            "strategy": strategy,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error snapping clip to scale: {e}")
+        return f"Error snapping clip to scale: {e}"
+
+
+@mcp.tool()
+def shape_clip_velocities(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    curve: str = "linear",
+    min_velocity: int = 20,
+    max_velocity: int = 110,
+) -> str:
+    """
+    Apply a velocity curve across a MIDI clip's notes (based on each note's
+    start_time fraction within the clip).
+
+    Curves:
+    - linear:           ramp min → max
+    - exp:              slow start, fast end (t²)
+    - inv_exp:          fast start, slow end
+    - soft_loud_soft:   bell curve, peak at clip midpoint
+    - loud_soft_loud:   inverse bell, dip at midpoint
+    - flat:             midpoint of (min, max) for all notes
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("shape_clip_velocities", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "curve": curve,
+            "min_velocity": int(min_velocity),
+            "max_velocity": int(max_velocity),
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error shaping velocities: {e}")
+        return f"Error shaping velocities: {e}"
+
+
+@mcp.tool()
+def set_cue_point_name(ctx: Context, cue_index: int, name: str) -> str:
+    """
+    Rename a cue point in Song.cue_points by index. Use get_cue_points first
+    to find indices.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_cue_point_name", {
+            "cue_index": int(cue_index),
+            "name": str(name),
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting cue point name: {e}")
+        return f"Error setting cue point name: {e}"
+
+
+@mcp.tool()
+def get_arrangement_loop(ctx: Context) -> str:
+    """
+    Read the arrangement loop region: {loop_enabled, loop_start, loop_length}.
+    Pair with set_arrangement_loop for the write side (already exists).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_arrangement_loop", {})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error reading arrangement loop: {e}")
+        return f"Error reading arrangement loop: {e}"
+
+
+@mcp.tool()
+def get_device_input_routings(ctx: Context, track_index: int, device_index: int) -> str:
+    """
+    List available and current input routing for a sidechain-capable device
+    (Compressor with S/C, External Instrument, etc.).
+
+    Use to discover valid source-track names before calling
+    `set_device_input_routing`. Errors on devices without input routing.
+
+    Returns: {device_name, available_input_types, current_input_type,
+              available_input_channels, current_input_channel}.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_device_input_routings", {
+            "track_index": track_index,
+            "device_index": device_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting device input routing: {e}")
+        return f"Error getting device input routing: {e}"
+
+
+@mcp.tool()
+def set_device_input_routing(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    type_display_name: str = None,
+    channel_display_name: str = None,
+) -> str:
+    """
+    Set a device's sidechain input source (e.g. Compressor S/C "Audio From"
+    dropdown) by display name.
+
+    For Compressor: type_display_name picks the SOURCE TRACK (typically
+    "1-Drums" or similar), channel_display_name picks Pre/Post FX or a
+    specific output channel.
+
+    Use `get_device_input_routings` first to see valid options. Match is
+    exact first, then case-insensitive substring fallback.
+
+    Parameters:
+    - track_index: track containing the device
+    - device_index: device index on that track
+    - type_display_name: source track / routing type name (e.g. "1-Drums")
+    - channel_display_name: channel within source (e.g. "Post FX")
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {"track_index": track_index, "device_index": device_index}
+        if type_display_name is not None:
+            params["type_display_name"] = type_display_name
+        if channel_display_name is not None:
+            params["channel_display_name"] = channel_display_name
+        if "type_display_name" not in params and "channel_display_name" not in params:
+            return "Error: provide at least one of type_display_name / channel_display_name"
+        result = ableton.send_command("set_device_input_routing", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting device input routing: {e}")
+        return f"Error setting device input routing: {e}"
 
 
 @mcp.tool()

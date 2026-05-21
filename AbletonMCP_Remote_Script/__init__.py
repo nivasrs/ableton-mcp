@@ -297,6 +297,12 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_transport_state()
             elif command_type == "get_scenes":
                 response["result"] = self._get_scenes()
+            elif command_type == "get_arrangement_loop":
+                response["result"] = self._get_arrangement_loop()
+            elif command_type == "get_device_input_routings":
+                track_index = params.get("track_index", 0)
+                device_index = params.get("device_index", 0)
+                response["result"] = self._get_device_input_routings(track_index, device_index)
             elif command_type == "get_available_routings":
                 response["result"] = self._get_available_routings(
                     params.get("track_index", 0))
@@ -372,7 +378,13 @@ class AbletonMCP(ControlSurface):
                                  "move_warp_marker",
                                  # Arrangement-clip writer (2026-05-19)
                                  "create_arrangement_clip_from_session",
-                                 "set_arrangement_clip_position"]:
+                                 "set_arrangement_clip_position",
+                                 # Device input routing (2026-05-21)
+                                 "set_device_input_routing",
+                                 # Gap-fill batch (2026-05-21)
+                                 "snap_clip_to_scale",
+                                 "shape_clip_velocities",
+                                 "set_cue_point_name"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -797,6 +809,30 @@ class AbletonMCP(ControlSurface):
                                 params.get("clip_index", 0),
                                 params.get("new_start_beat"),
                                 params.get("new_length"))
+                        elif command_type == "set_device_input_routing":
+                            result = self._set_device_input_routing(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("type_display_name"),
+                                params.get("channel_display_name"))
+                        elif command_type == "snap_clip_to_scale":
+                            result = self._snap_clip_to_scale(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("root_note", 0),
+                                params.get("scale_name", "Major"),
+                                params.get("strategy", "nearest"))
+                        elif command_type == "shape_clip_velocities":
+                            result = self._shape_clip_velocities(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("curve", "linear"),
+                                params.get("min_velocity", 20),
+                                params.get("max_velocity", 110))
+                        elif command_type == "set_cue_point_name":
+                            result = self._set_cue_point_name(
+                                params.get("cue_index", 0),
+                                params.get("name", ""))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1720,6 +1756,114 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting track routing: " + str(e))
             raise
 
+    def _get_device_input_routings(self, track_index, device_index):
+        """List available + current input routing for a device (sidechain source).
+
+        Only devices with audio-input routing (Compressor with S/C, External
+        Instrument, etc.) have these properties. Raises if the device lacks
+        the attributes.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+            device = track.devices[device_index]
+            if not hasattr(device, "available_input_routing_types"):
+                raise Exception(
+                    "Device '{0}' has no input routing — only sidechain-"
+                    "capable devices (Compressor, External Instrument, …) "
+                    "expose this".format(getattr(device, "name", "?")))
+            result = {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": getattr(device, "name", "?"),
+            }
+            for kind in ("type", "channel"):
+                avail_attr = "available_input_routing_{0}s".format(kind)
+                curr_attr = "input_routing_{0}".format(kind)
+                avail = getattr(device, avail_attr, None) or []
+                curr = getattr(device, curr_attr, None)
+                result["available_input_{0}s".format(kind)] = [
+                    getattr(o, "display_name", str(o)) for o in avail]
+                result["current_input_{0}".format(kind)] = (
+                    getattr(curr, "display_name", None) if curr else None)
+            return result
+        except Exception as e:
+            self.log_message("Error reading device input routing: " + str(e))
+            raise
+
+    def _set_device_input_routing(self, track_index, device_index,
+                                    type_display_name=None,
+                                    channel_display_name=None):
+        """Set Device.input_routing_type and/or input_routing_channel by display name.
+
+        Looks up the matching RoutingType / RoutingChannel object in the
+        device's available_input_routing_* list (case-insensitive substring
+        match if no exact hit), then assigns. Used for wiring Compressor
+        sidechain source to a specific track.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+            device = track.devices[device_index]
+            if not hasattr(device, "available_input_routing_types"):
+                raise Exception(
+                    "Device '{0}' has no input routing".format(
+                        getattr(device, "name", "?")))
+            if type_display_name is None and channel_display_name is None:
+                raise ValueError(
+                    "Provide at least one of type_display_name / channel_display_name")
+            changed = {}
+
+            def find_option(options, name):
+                exact = next((o for o in options
+                              if getattr(o, "display_name", "") == name), None)
+                if exact:
+                    return exact
+                low = name.lower()
+                fuzzy = next((o for o in options
+                              if low in getattr(o, "display_name", "").lower()), None)
+                return fuzzy
+
+            if type_display_name is not None:
+                opts = getattr(device, "available_input_routing_types", []) or []
+                option = find_option(opts, type_display_name)
+                if option is None:
+                    raise Exception(
+                        "No input routing type matches '{0}'. Available: {1}".format(
+                            type_display_name,
+                            [getattr(o, "display_name", "?") for o in opts]))
+                device.input_routing_type = option
+                changed["input_routing_type"] = getattr(
+                    device.input_routing_type, "display_name", "?")
+
+            if channel_display_name is not None:
+                opts = getattr(device, "available_input_routing_channels", []) or []
+                option = find_option(opts, channel_display_name)
+                if option is None:
+                    raise Exception(
+                        "No input routing channel matches '{0}'. Available: {1}".format(
+                            channel_display_name,
+                            [getattr(o, "display_name", "?") for o in opts]))
+                device.input_routing_channel = option
+                changed["input_routing_channel"] = getattr(
+                    device.input_routing_channel, "display_name", "?")
+
+            return {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": getattr(device, "name", "?"),
+                "changed": changed,
+            }
+        except Exception as e:
+            self.log_message("Error setting device input routing: " + str(e))
+            raise
+
     def _set_track_state(self, track_index, attribute, value):
         """Set mute/solo/arm on a track."""
         try:
@@ -1896,11 +2040,19 @@ class AbletonMCP(ControlSurface):
                         len(clips) - 1))
             clip = clips[clip_index]
 
-            # Capture current state
+            # Capture current state (preserve as much as we can across delete+recreate)
             cur_start = float(clip.start_time)
             cur_length = float(clip.length)
             is_midi = bool(clip.is_midi_clip)
             cur_name = clip.name
+            cur_color = self._safe_get(clip, "color")
+            cur_color_index = self._safe_get(clip, "color_index")
+            cur_gain = self._safe_get(clip, "gain")
+            cur_pitch_coarse = self._safe_get(clip, "pitch_coarse")
+            cur_pitch_fine = self._safe_get(clip, "pitch_fine")
+            cur_looping = self._safe_get(clip, "looping", bool)
+            cur_loop_start = self._safe_get(clip, "loop_start")
+            cur_loop_end = self._safe_get(clip, "loop_end")
 
             # Resolve targets
             target_start = (
@@ -1949,12 +2101,27 @@ class AbletonMCP(ControlSurface):
                 except Exception:
                     pass
 
-            # Preserve name if any
-            if cur_name:
+            # Preserve as many attributes as Live exposes as writable on the
+            # new clip. Each setter is wrapped because Live's clip attribute
+            # writability varies by clip type (MIDI/audio) and Live version.
+            def _try_set(obj, attr, value):
+                if value is None:
+                    return
                 try:
-                    new_clip.name = cur_name
+                    setattr(obj, attr, value)
                 except Exception:
                     pass
+
+            if cur_name:
+                _try_set(new_clip, "name", cur_name)
+            _try_set(new_clip, "color", cur_color)
+            _try_set(new_clip, "color_index", cur_color_index)
+            _try_set(new_clip, "gain", cur_gain)
+            _try_set(new_clip, "pitch_coarse", cur_pitch_coarse)
+            _try_set(new_clip, "pitch_fine", cur_pitch_fine)
+            _try_set(new_clip, "looping", cur_looping)
+            _try_set(new_clip, "loop_start", cur_loop_start)
+            _try_set(new_clip, "loop_end", cur_loop_end)
 
             # Locate new clip's index in arrangement_clips (search by start_time)
             new_clips = track.arrangement_clips
@@ -1977,6 +2144,196 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error setting arrangement clip position: " + str(e))
+            raise
+
+    # ----------------------------------------------------------------
+    # Gap-fill batch (2026-05-21): scale-snap, velocity-shape, cue name,
+    # arrangement loop read.
+    # ----------------------------------------------------------------
+
+    _SCALE_INTERVALS = {
+        "Major":            [0, 2, 4, 5, 7, 9, 11],
+        "Minor":            [0, 2, 3, 5, 7, 8, 10],
+        "Natural Minor":    [0, 2, 3, 5, 7, 8, 10],
+        "Harmonic Minor":   [0, 2, 3, 5, 7, 8, 11],
+        "Melodic Minor":    [0, 2, 3, 5, 7, 9, 11],
+        "Dorian":           [0, 2, 3, 5, 7, 9, 10],
+        "Phrygian":         [0, 1, 3, 5, 7, 8, 10],
+        "Lydian":           [0, 2, 4, 6, 7, 9, 11],
+        "Mixolydian":       [0, 2, 4, 5, 7, 9, 10],
+        "Locrian":          [0, 1, 3, 5, 6, 8, 10],
+        "Pentatonic Major": [0, 2, 4, 7, 9],
+        "Pentatonic Minor": [0, 3, 5, 7, 10],
+        "Blues":            [0, 3, 5, 6, 7, 10],
+        "Chromatic":        list(range(12)),
+    }
+
+    def _snap_clip_to_scale(self, track_index, clip_index, root_note,
+                              scale_name, strategy="nearest"):
+        """Pitch-snap each note in a clip to the target scale.
+
+        Strategy:
+          - "nearest": move to nearest scale tone (ties go up)
+          - "down":    move to nearest scale tone at or below current pitch
+          - "up":      move to nearest scale tone at or above current pitch
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise Exception("Clip slot is empty")
+            clip = slot.clip
+            if not clip.is_midi_clip:
+                raise Exception("Source clip is not MIDI")
+            if scale_name not in self._SCALE_INTERVALS:
+                raise ValueError(
+                    "Unknown scale '{0}'. Known: {1}".format(
+                        scale_name, list(self._SCALE_INTERVALS.keys())))
+            root = int(root_note) % 12
+            intervals = self._SCALE_INTERVALS[scale_name]
+            scale_pcs = set((root + iv) % 12 for iv in intervals)
+
+            def snap_pitch(p):
+                if (p % 12) in scale_pcs:
+                    return p
+                if strategy == "up":
+                    candidates = [p + d for d in range(1, 12) if (p + d) % 12 in scale_pcs]
+                    return candidates[0] if candidates else p
+                if strategy == "down":
+                    candidates = [p - d for d in range(1, 12) if (p - d) % 12 in scale_pcs]
+                    return candidates[0] if candidates else p
+                # nearest (ties go up)
+                up = next((d for d in range(1, 12) if (p + d) % 12 in scale_pcs), 12)
+                down = next((d for d in range(1, 12) if (p - d) % 12 in scale_pcs), 12)
+                return p + up if up <= down else p - down
+
+            notes = clip.get_notes(0, 0, clip.length, 128)
+            new_notes = []
+            changed = 0
+            for n in notes:
+                # (pitch, time, length, velocity, mute)
+                pitch, t, length, vel, mute = n
+                new_pitch = snap_pitch(int(pitch))
+                if new_pitch != pitch:
+                    changed += 1
+                new_notes.append((new_pitch, t, length, vel, mute))
+            clip.set_notes(tuple(new_notes))
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "scale": scale_name,
+                "root_note": root,
+                "strategy": strategy,
+                "note_count": len(notes),
+                "notes_changed": changed,
+            }
+        except Exception as e:
+            self.log_message("Error snapping clip to scale: " + str(e))
+            raise
+
+    def _shape_clip_velocities(self, track_index, clip_index, curve="linear",
+                                 min_velocity=20, max_velocity=110, seed=0):
+        """Apply a velocity curve across a clip's notes.
+
+        Curves (computed from each note's start_time as a fraction t in [0,1]):
+          - linear:           lerp(min, max, t)
+          - exp:              min + (max-min) * t^2 (slow start, fast end)
+          - inv_exp:          max - (max-min) * (1-t)^2 (fast start, slow end)
+          - soft_loud_soft:   bell curve peaking mid-clip
+          - loud_soft_loud:   inverse bell (U-shape)
+          - flat:             midpoint of min/max
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise Exception("Clip slot is empty")
+            clip = slot.clip
+            if not clip.is_midi_clip:
+                raise Exception("Clip is not MIDI")
+            length = float(clip.length) or 1.0
+            mn = max(1, min(127, int(min_velocity)))
+            mx = max(1, min(127, int(max_velocity)))
+            lo, hi = min(mn, mx), max(mn, mx)
+            spread = hi - lo
+
+            def value_at(t):
+                t = max(0.0, min(1.0, t))
+                if curve == "linear":
+                    return lo + spread * t
+                if curve == "exp":
+                    return lo + spread * (t * t)
+                if curve == "inv_exp":
+                    return hi - spread * ((1.0 - t) ** 2)
+                if curve == "soft_loud_soft":
+                    # peak at t=0.5, bell shape via 4*t*(1-t)
+                    return lo + spread * (4.0 * t * (1.0 - t))
+                if curve == "loud_soft_loud":
+                    # dip at t=0.5
+                    return lo + spread * (1.0 - 4.0 * t * (1.0 - t))
+                if curve == "flat":
+                    return lo + spread * 0.5
+                raise ValueError("Unknown curve '{0}'".format(curve))
+
+            notes = clip.get_notes(0, 0, length, 128)
+            new_notes = []
+            for n in notes:
+                pitch, t, dur, vel, mute = n
+                frac = float(t) / length if length > 0 else 0.0
+                new_vel = int(round(value_at(frac)))
+                new_vel = max(1, min(127, new_vel))
+                new_notes.append((pitch, t, dur, new_vel, mute))
+            clip.set_notes(tuple(new_notes))
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "curve": curve,
+                "min_velocity": lo,
+                "max_velocity": hi,
+                "note_count": len(notes),
+            }
+        except Exception as e:
+            self.log_message("Error shaping velocities: " + str(e))
+            raise
+
+    def _set_cue_point_name(self, cue_index, name):
+        """Rename a cue point in Song.cue_points by index."""
+        try:
+            cues = list(self._song.cue_points)
+            if cue_index < 0 or cue_index >= len(cues):
+                raise IndexError(
+                    "Cue index out of range (0..{0})".format(len(cues) - 1))
+            old = cues[cue_index].name
+            cues[cue_index].name = str(name)
+            return {
+                "cue_index": cue_index,
+                "old_name": old,
+                "new_name": cues[cue_index].name,
+                "time": float(cues[cue_index].time),
+            }
+        except Exception as e:
+            self.log_message("Error setting cue point name: " + str(e))
+            raise
+
+    def _get_arrangement_loop(self):
+        """Read the arrangement loop region (Song.loop / loop_start / loop_length)."""
+        try:
+            song = self._song
+            return {
+                "loop_enabled": self._safe_get(song, "loop", bool),
+                "loop_start": self._safe_get(song, "loop_start"),
+                "loop_length": self._safe_get(song, "loop_length"),
+            }
+        except Exception as e:
+            self.log_message("Error reading arrangement loop: " + str(e))
             raise
 
     def _set_clip_loop_region(self, track_index, clip_index, loop_start, loop_end):
