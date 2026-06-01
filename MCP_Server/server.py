@@ -160,6 +160,13 @@ class AbletonConnection:
             "set_focused_view", "set_view_visible",
             "delete_notes_in_range", "delete_notes_with_pitch",
             "duplicate_clip_loop",
+            # Option-B-2 batch (2026-06-01) — mutating commands only
+            "apply_note_modifications",
+            "seek_to", "seek_by",
+            "set_track_activator",
+            "set_clip_markers",
+            "set_session_automation_record",
+            "set_exclusive_mode",
         ]
         
         try:
@@ -3960,6 +3967,362 @@ def duplicate_clip_loop(
     except Exception as e:
         logger.error(f"Error duplicate_clip_loop: {e}")
         return f"Error duplicate_clip_loop: {e}"
+
+
+@mcp.tool()
+def get_notes_extended(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    from_time: float = 0.0,
+    time_span: float = None,
+    from_pitch: int = 0,
+    pitch_span: int = 128,
+    location: str = "session",
+) -> str:
+    """
+    Read MIDI notes via Live's new note API (Clip.get_notes_extended).
+
+    Returns a per-note dict for each note INCLUDING:
+      - note_id (required for apply_note_modifications)
+      - pitch, start_time, duration, velocity, mute
+      - probability, velocity_deviation, release_velocity
+
+    Falls back to the old (pitch, start_time, duration, velocity, mute)
+    tuple shape if the Live build doesn't expose get_notes_extended;
+    the response's `api` field is 'new' or 'old' accordingly.
+
+    Defaults to the whole clip (time_span=None -> clip.length, pitch 0..127).
+
+    Parameters:
+    - track_index: 0-based.
+    - clip_index: session slot OR arrangement_clips index.
+    - from_time, time_span: time-rectangle to query (beats). time_span=None
+      means full clip length.
+    - from_pitch, pitch_span: pitch rectangle (defaults 0/128 = all).
+    - location: 'session' (default) or 'arrangement'.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "from_time": float(from_time),
+            "from_pitch": int(from_pitch),
+            "pitch_span": int(pitch_span),
+            "location": location,
+        }
+        if time_span is not None:
+            params["time_span"] = float(time_span)
+        result = ableton.send_command("get_notes_extended", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error get_notes_extended: {e}")
+        return f"Error get_notes_extended: {e}"
+
+
+@mcp.tool()
+def apply_note_modifications(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    notes: List[Dict[str, Any]],
+    location: str = "session",
+) -> str:
+    """
+    Mutate existing MIDI notes in-place by note_id (Clip.apply_note_modifications).
+
+    `notes` is a list of dicts; each MUST include 'note_id' (from a prior
+    get_notes_extended call). The remote script calls
+    clip.get_notes_by_id(ids), setattr's each supplied field on the live
+    MidiNote, then hands the vector back to Live — mirroring the
+    Max-for-Live bridge pattern.
+
+    Mutable fields per note:
+      pitch, start_time, duration, velocity, mute,
+      probability, velocity_deviation, release_velocity
+
+    Typical humanization flow:
+      1. get_notes_extended(track, clip)
+      2. For each returned note, tweak velocity_deviation / start_time /
+         duration / probability — KEEP the note_id.
+      3. apply_note_modifications(track, clip, modified_notes)
+
+    NOTE: this is DIFFERENT from add_notes_to_clip — that creates new
+    notes (no note_id). To CREATE new notes use add_notes_to_clip; to
+    MUTATE existing notes use this.
+
+    Parameters:
+    - track_index: 0-based.
+    - clip_index: session slot OR arrangement_clips index.
+    - notes: list of dicts with note_id + fields to change.
+    - location: 'session' (default) or 'arrangement'.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("apply_note_modifications", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "notes": notes,
+            "location": location,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error apply_note_modifications: {e}")
+        return f"Error apply_note_modifications: {e}"
+
+
+@mcp.tool()
+def seek_to(
+    ctx: Context,
+    beat_time: float,
+) -> str:
+    """
+    Move Live's playhead to `beat_time` (beats from song start).
+
+    Uses Live's own write-both pattern: always writes
+    Song.current_song_time; if stopped, also writes Song.start_time
+    (so that Play resumes from the new position). This is the canonical
+    sequence Live's transport components use across v2/v3 and several
+    third-party Remote Scripts.
+
+    BEST-EFFORT while transport is STOPPED — on Live 12.3.7 prior tests
+    sometimes found current_song_time read-only when stopped. The
+    start_time fallback usually wins but isn't guaranteed for every
+    session state (e.g. active punch-in/punch-out or armed tracks may
+    block it). Inspect the returned `wrote_current_song_time` /
+    `wrote_start_time` flags to confirm.
+
+    Parameters:
+    - beat_time: target position in beats from song start (clamped >= 0).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("seek_to", {
+            "beat_time": float(beat_time),
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error seek_to: {e}")
+        return f"Error seek_to: {e}"
+
+
+@mcp.tool()
+def seek_by(
+    ctx: Context,
+    delta_beats: float,
+) -> str:
+    """
+    Move Live's playhead by `delta_beats` relative to current position.
+
+    Reads Song.current_song_time, adds delta (clamped >= 0), and calls
+    seek_to. Same BEST-EFFORT caveats as seek_to apply when transport is
+    stopped.
+
+    Parameters:
+    - delta_beats: signed delta. Negative seeks backward; result is
+      clamped to >= 0.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("seek_by", {
+            "delta_beats": float(delta_beats),
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error seek_by: {e}")
+        return f"Error seek_by: {e}"
+
+
+@mcp.tool()
+def get_track_activator(
+    ctx: Context,
+    track_index: int,
+) -> str:
+    """
+    Read Track.mixer_device.track_activator (the AUTOMATABLE active/mute).
+
+    `track_activator` is a Live.DeviceParameter (NOT a plain bool) — it
+    can be automated via clip envelopes or arrangement automation lanes.
+    This is distinct from `Track.mute`, which is a plain non-automatable
+    bool. Value semantics: 1.0 = active (unmuted), 0.0 = muted.
+
+    Parameters:
+    - track_index: 0-based.
+
+    Returns {value, min, max, name, is_enabled, track_index}.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_activator", {
+            "track_index": track_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error get_track_activator: {e}")
+        return f"Error get_track_activator: {e}"
+
+
+@mcp.tool()
+def set_track_activator(
+    ctx: Context,
+    track_index: int,
+    value,
+) -> str:
+    """
+    Write Track.mixer_device.track_activator.value (automatable mute).
+
+    Use this when you need the value to participate in clip envelopes or
+    arrangement automation. For one-shot non-automated muting, use
+    set_track_state(attribute='mute', ...).
+
+    Parameters:
+    - track_index: 0-based.
+    - value: bool / 0|1 / 0.0|1.0. Anything >= 0.5 is treated as active.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_activator", {
+            "track_index": track_index,
+            "value": value,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error set_track_activator: {e}")
+        return f"Error set_track_activator: {e}"
+
+
+@mcp.tool()
+def set_clip_markers(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    start_marker: Optional[float] = None,
+    end_marker: Optional[float] = None,
+    location: str = "session",
+) -> str:
+    """
+    Set Clip.start_marker and/or Clip.end_marker (independent of loop region).
+
+    Either or both may be None (no change). The remote script orders the
+    two writes so the range is never transiently inverted — Live will
+    reject a write that crosses the other marker.
+
+    For audio clips, start_marker / end_marker define the audible region
+    inside the underlying sample. For MIDI clips, they define the
+    playable region inside the clip's note buffer. Loop region
+    (loop_start/loop_end) is a SEPARATE concept — use set_clip_loop_region
+    for that.
+
+    Parameters:
+    - track_index: 0-based.
+    - clip_index: session slot OR arrangement_clips index.
+    - start_marker: new start in beats, or None to leave unchanged.
+    - end_marker: new end in beats, or None to leave unchanged.
+    - location: 'session' (default) or 'arrangement'.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "location": location,
+        }
+        if start_marker is not None:
+            params["start_marker"] = float(start_marker)
+        if end_marker is not None:
+            params["end_marker"] = float(end_marker)
+        result = ableton.send_command("set_clip_markers", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error set_clip_markers: {e}")
+        return f"Error set_clip_markers: {e}"
+
+
+@mcp.tool()
+def set_session_automation_record(
+    ctx: Context,
+    enabled: bool,
+) -> str:
+    """
+    Toggle Song.session_automation_record.
+
+    When True, parameter changes made in the session view while a clip is
+    playing are recorded into that clip's envelopes. Pair with
+    set_session_record / set_record_mode for full automation capture
+    workflows.
+
+    Also surfaced in the get_transport_state response as the
+    `session_automation_record` field.
+
+    Parameters:
+    - enabled: True to enable, False to disable.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_session_automation_record", {
+            "enabled": bool(enabled),
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error set_session_automation_record: {e}")
+        return f"Error set_session_automation_record: {e}"
+
+
+@mcp.tool()
+def get_exclusive_mode(ctx: Context) -> str:
+    """
+    Read Song.exclusive_arm and Song.exclusive_solo.
+
+    These are global Live PREFERENCES (Preferences > Record > Exclusive
+    Arm / Exclusive Solo) that persist across sessions:
+      - exclusive_arm=True: arming a track auto-unarms others.
+      - exclusive_solo=True: soloing a track auto-unsolos others.
+
+    Useful before calling set_track_state(attribute='arm'|'solo', ...)
+    so the caller knows whether Live will auto-cascade.
+
+    Returns {exclusive_arm: bool, exclusive_solo: bool}.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_exclusive_mode", {})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error get_exclusive_mode: {e}")
+        return f"Error get_exclusive_mode: {e}"
+
+
+@mcp.tool()
+def set_exclusive_mode(
+    ctx: Context,
+    exclusive_arm: Optional[bool] = None,
+    exclusive_solo: Optional[bool] = None,
+) -> str:
+    """
+    Write Song.exclusive_arm / Song.exclusive_solo. Either or both may be None.
+
+    WARNING: these are **global Live preferences** that PERSIST across
+    sessions and affect ALL future projects the user opens. Read with
+    get_exclusive_mode first and only flip when the caller has explicitly
+    asked. Always returns before/after for verification.
+
+    Parameters:
+    - exclusive_arm: True/False, or None to leave unchanged.
+    - exclusive_solo: True/False, or None to leave unchanged.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {}
+        if exclusive_arm is not None:
+            params["exclusive_arm"] = bool(exclusive_arm)
+        if exclusive_solo is not None:
+            params["exclusive_solo"] = bool(exclusive_solo)
+        result = ableton.send_command("set_exclusive_mode", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error set_exclusive_mode: {e}")
+        return f"Error set_exclusive_mode: {e}"
 
 
 # Main execution

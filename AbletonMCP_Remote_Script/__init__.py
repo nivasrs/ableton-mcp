@@ -314,6 +314,12 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_warp_markers(
                     params.get("track_index", 0),
                     params.get("clip_index", 0))
+            # Option-B-2 reads (2026-06-01): inline, no main-thread roundtrip
+            elif command_type == "get_track_activator":
+                response["result"] = self._get_track_activator(
+                    params.get("track_index", 0))
+            elif command_type == "get_exclusive_mode":
+                response["result"] = self._get_exclusive_mode()
             # These commands must run on the main thread (writes + note reads)
             elif command_type in ["get_clip_notes",
                                  "create_midi_track", "set_track_name",
@@ -394,7 +400,15 @@ class AbletonMCP(ControlSurface):
                                  "get_track_playback_state",
                                  "delete_notes_in_range",
                                  "delete_notes_with_pitch",
-                                 "duplicate_clip_loop"]:
+                                 "duplicate_clip_loop",
+                                 # Option-B-2 batch (2026-06-01)
+                                 "get_notes_extended",
+                                 "apply_note_modifications",
+                                 "seek_to", "seek_by",
+                                 "set_track_activator",
+                                 "set_clip_markers",
+                                 "set_session_automation_record",
+                                 "set_exclusive_mode"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -892,6 +906,46 @@ class AbletonMCP(ControlSurface):
                                 params.get("track_index", 0),
                                 params.get("clip_index", 0),
                                 params.get("location", "session"))
+                        # Option-B-2 batch (2026-06-01)
+                        elif command_type == "get_notes_extended":
+                            result = self._get_notes_extended(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("from_time", 0.0),
+                                params.get("time_span"),
+                                params.get("from_pitch", 0),
+                                params.get("pitch_span", 128),
+                                params.get("location", "session"))
+                        elif command_type == "apply_note_modifications":
+                            result = self._apply_note_modifications(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("notes", []),
+                                params.get("location", "session"))
+                        elif command_type == "seek_to":
+                            result = self._seek_to(
+                                params.get("beat_time", 0.0))
+                        elif command_type == "seek_by":
+                            result = self._seek_by(
+                                params.get("delta_beats", 0.0))
+                        elif command_type == "set_track_activator":
+                            result = self._set_track_activator(
+                                params.get("track_index", 0),
+                                params.get("value", 1))
+                        elif command_type == "set_clip_markers":
+                            result = self._set_clip_markers(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("start_marker"),
+                                params.get("end_marker"),
+                                params.get("location", "session"))
+                        elif command_type == "set_session_automation_record":
+                            result = self._set_session_automation_record(
+                                bool(params.get("enabled", False)))
+                        elif command_type == "set_exclusive_mode":
+                            result = self._set_exclusive_mode(
+                                params.get("exclusive_arm"),
+                                params.get("exclusive_solo"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1253,6 +1307,7 @@ class AbletonMCP(ControlSurface):
                 "track_index": track_index,
                 "device_index": device_index,
                 "device_name": device.name,
+                "class_name": getattr(device, "class_name", None),
                 "parameters": [
                     self._param_info(p, i) for i, p in enumerate(device.parameters)
                 ],
@@ -4994,9 +5049,19 @@ class AbletonMCP(ControlSurface):
         """
         try:
             song = self._song
+            # Option-B-2: session_record_status enum 0/1/2 = off/transition/on
+            srs_raw = self._safe_get(song, "session_record_status")
+            srs_int = None
+            srs_label = None
+            try:
+                srs_int = int(srs_raw)
+                srs_label = ("off", "transition", "on")[srs_int] if 0 <= srs_int <= 2 else str(srs_raw)
+            except Exception:
+                srs_label = str(srs_raw) if srs_raw is not None else None
             return {
                 "tempo": song.tempo,
                 "is_playing": self._safe_get(song, "is_playing", bool),
+                "current_song_time": self._safe_get(song, "current_song_time", float),
                 "metronome": self._safe_get(song, "metronome", bool),
                 "count_in_duration": self._safe_get(song, "count_in_duration"),
                 "midi_recording_quantization": self._safe_get(song, "midi_recording_quantization"),
@@ -5006,10 +5071,15 @@ class AbletonMCP(ControlSurface):
                 "signature_denominator": song.signature_denominator,
                 "record_mode": self._safe_get(song, "record_mode", bool),
                 "session_record": self._safe_get(song, "session_record", bool),
+                "session_record_status": srs_label,
+                "session_record_status_value": srs_int,
+                "session_automation_record": self._safe_get(song, "session_automation_record", bool),
                 "arrangement_overdub": self._safe_get(song, "arrangement_overdub", bool),
                 "back_to_arranger": self._safe_get(song, "back_to_arranger", bool),
                 "punch_in": self._safe_get(song, "punch_in", bool),
                 "punch_out": self._safe_get(song, "punch_out", bool),
+                "exclusive_arm": self._safe_get(song, "exclusive_arm", bool),
+                "exclusive_solo": self._safe_get(song, "exclusive_solo", bool),
                 "loop": self._safe_get(song, "loop", bool),
                 "loop_start": self._safe_get(song, "loop_start"),
                 "loop_length": self._safe_get(song, "loop_length"),
@@ -5676,4 +5746,420 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error duplicate_clip_loop: " + str(e))
+            raise
+
+    # ---------------- Option-B-2 batch (2026-06-01) ----------------
+    # New API note ops, transport seek, track_activator, clip markers,
+    # session automation record, exclusive arm/solo.
+
+    def _get_notes_extended(self, track_index, clip_index,
+                            from_time=0.0, time_span=None,
+                            from_pitch=0, pitch_span=128,
+                            location="session"):
+        """Read MIDI notes via the new note API (returns per-note dicts
+        including note_id, probability, velocity_deviation, release_velocity).
+
+        Defaults to whole-clip (time_span=None -> clip.length, pitch 0..127).
+        Falls back to clip.get_notes() if get_notes_extended is missing on
+        this Live build.
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, location)
+            if not bool(getattr(clip, "is_midi_clip", False)):
+                raise Exception("Clip is not a MIDI clip")
+            ft = float(from_time)
+            ts = float(time_span) if time_span is not None else max(
+                float(self._safe_get(clip, "length", float) or 0.0), 1.0)
+            if ts <= 0:
+                raise ValueError("time_span must be > 0")
+            fp = int(from_pitch)
+            ps = int(pitch_span)
+            if fp < 0 or fp > 127:
+                raise ValueError("from_pitch must be in 0..127")
+            if ps <= 0 or fp + ps > 128:
+                raise ValueError("invalid pitch_span")
+            attrs = ("note_id", "pitch", "start_time", "duration", "velocity",
+                     "mute", "probability", "velocity_deviation",
+                     "release_velocity")
+            notes_out = []
+            if hasattr(clip, "get_notes_extended"):
+                # Live 12.3.7 actual signature is (from_pitch, pitch_span,
+                # from_time, time_span) — verified empirically 2026-06-01.
+                # Same INTS-then-FLOATS pattern as remove_notes_extended.
+                vec = clip.get_notes_extended(fp, ps, ft, ts)
+                for n in vec:
+                    d = {}
+                    for a in attrs:
+                        try:
+                            v = getattr(n, a)
+                            # Coerce numerics so JSON serializes cleanly
+                            if a in ("note_id", "pitch", "velocity"):
+                                v = int(v)
+                            elif a in ("mute",):
+                                v = bool(v)
+                            elif a in ("start_time", "duration",
+                                       "probability", "velocity_deviation",
+                                       "release_velocity"):
+                                v = float(v)
+                            d[a] = v
+                        except Exception:
+                            pass
+                    notes_out.append(d)
+                api = "new"
+            else:
+                # Fallback: old API tuples (no note_id, no probability, etc.)
+                raw = clip.get_notes(ft, fp, ts, ps)
+                for t in raw:
+                    notes_out.append({
+                        "pitch": int(t[0]),
+                        "start_time": float(t[1]),
+                        "duration": float(t[2]),
+                        "velocity": int(t[3]),
+                        "mute": bool(t[4]),
+                    })
+                api = "old"
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "location": str(location).lower(),
+                "api": api,
+                "from_time": ft,
+                "time_span": ts,
+                "from_pitch": fp,
+                "pitch_span": ps,
+                "note_count": len(notes_out),
+                "notes": notes_out,
+            }
+        except Exception as e:
+            self.log_message("Error get_notes_extended: " + str(e))
+            raise
+
+    def _apply_note_modifications(self, track_index, clip_index, notes,
+                                  location="session"):
+        """Mutate existing notes by note_id.
+
+        Live's `apply_note_modifications` requires the **same MidiNote
+        vector** returned by `get_notes_by_id` (or `get_notes_extended`)
+        with attributes mutated in place — NOT a freshly-constructed list.
+        We mirror the Max-for-Live bridge pattern: collect note_ids from
+        the incoming dicts, call `clip.get_notes_by_id(ids)`, setattr
+        every supported field per note, then hand the vector back to
+        Live.
+
+        `notes` is a list of dicts. Each dict MUST include 'note_id'.
+        Mutable fields: pitch, start_time, duration, velocity, mute,
+        probability, velocity_deviation, release_velocity.
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, location)
+            if not bool(getattr(clip, "is_midi_clip", False)):
+                raise Exception("Clip is not a MIDI clip")
+            if not isinstance(notes, (list, tuple)) or not notes:
+                return {
+                    "ok": True, "modified": 0,
+                    "track_index": track_index, "clip_index": clip_index,
+                    "location": str(location).lower(),
+                    "note": "no notes supplied",
+                }
+            if not hasattr(clip, "apply_note_modifications") or \
+               not hasattr(clip, "get_notes_by_id"):
+                raise Exception(
+                    "Live build lacks apply_note_modifications/get_notes_by_id "
+                    "— use add_notes_to_clip + delete_notes_in_range instead")
+            ids = []
+            by_id = {}
+            for d in notes:
+                if not isinstance(d, dict) or "note_id" not in d:
+                    raise ValueError("each note must be a dict with 'note_id'")
+                nid = int(d["note_id"])
+                ids.append(nid)
+                by_id[nid] = d
+            vec = clip.get_notes_by_id(ids)
+            mutable = ("pitch", "start_time", "duration", "velocity", "mute",
+                       "probability", "velocity_deviation", "release_velocity")
+            modified = 0
+            for note in vec:
+                d = by_id.get(int(getattr(note, "note_id")))
+                if not d:
+                    continue
+                for a in mutable:
+                    if a not in d:
+                        continue
+                    try:
+                        v = d[a]
+                        if a == "mute":
+                            v = bool(v)
+                        elif a in ("pitch", "velocity"):
+                            v = int(v)
+                        else:
+                            v = float(v)
+                        setattr(note, a, v)
+                    except Exception as inner:
+                        self.log_message(
+                            "skip apply field {0}: {1}".format(a, inner))
+                modified += 1
+            clip.apply_note_modifications(vec)
+            return {
+                "ok": True,
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "location": str(location).lower(),
+                "requested": len(notes),
+                "modified": modified,
+            }
+        except Exception as e:
+            self.log_message("Error apply_note_modifications: " + str(e))
+            raise
+
+    def _seek_to(self, beat_time):
+        """Set the song playhead to `beat_time`.
+
+        Uses Live's own "write-both" pattern from
+        ableton/v2/base/live_api_utils.py:30-36: always writes
+        current_song_time; if stopped, also writes start_time. This is
+        the canonical sequence used by transport components across v2/v3
+        and Novation/Mackie/Akai control surfaces.
+
+        BEST-EFFORT while transport is stopped: prior testing on Live
+        12.3.7 sometimes found current_song_time read-only when stopped;
+        the start_time fallback usually wins but isn't guaranteed for
+        every session state.
+        """
+        try:
+            song = self._song
+            t = max(0.0, float(beat_time))
+            was_playing = bool(self._safe_get(song, "is_playing", bool))
+            wrote_current = False
+            wrote_start = False
+            err_current = None
+            err_start = None
+            try:
+                song.current_song_time = t
+                wrote_current = True
+            except Exception as e:
+                err_current = str(e)
+            if not was_playing:
+                try:
+                    song.start_time = t
+                    wrote_start = True
+                except Exception as e:
+                    err_start = str(e)
+            # current_song_time readback is one Live-tick stale when stopped
+            # (the write succeeds but the property reflects asynchronously).
+            # If we wrote successfully while stopped, trust the requested value
+            # and echo it back so seek_by chains accurately.
+            if (wrote_current or wrote_start) and not was_playing:
+                new_t = t
+            else:
+                new_t = float(self._safe_get(song, "current_song_time", float) or 0.0)
+            return {
+                "ok": wrote_current or wrote_start,
+                "requested": t,
+                "current_song_time": new_t,
+                "was_playing": was_playing,
+                "wrote_current_song_time": wrote_current,
+                "wrote_start_time": wrote_start,
+                "current_song_time_error": err_current,
+                "start_time_error": err_start,
+            }
+        except Exception as e:
+            self.log_message("Error seek_to: " + str(e))
+            raise
+
+    def _seek_by(self, delta_beats):
+        """Seek by delta beats relative to current playhead."""
+        try:
+            song = self._song
+            current = float(self._safe_get(song, "current_song_time", float) or 0.0)
+            target = max(0.0, current + float(delta_beats))
+            return self._seek_to(target)
+        except Exception as e:
+            self.log_message("Error seek_by: " + str(e))
+            raise
+
+    def _get_track_activator(self, track_index):
+        """Read Track.mixer_device.track_activator.value (1.0 active / 0.0 muted)."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            mixer = getattr(track, "mixer_device", None)
+            if mixer is None or not hasattr(mixer, "track_activator"):
+                raise Exception("Track has no mixer_device.track_activator")
+            param = mixer.track_activator
+            return {
+                "track_index": track_index,
+                "value": float(param.value),
+                "min": float(self._safe_get(param, "min", float) or 0.0),
+                "max": float(self._safe_get(param, "max", float) or 1.0),
+                "name": self._safe_get(param, "name"),
+                "is_enabled": bool(self._safe_get(param, "is_enabled", bool)),
+            }
+        except Exception as e:
+            self.log_message("Error get_track_activator: " + str(e))
+            raise
+
+    def _set_track_activator(self, track_index, value):
+        """Write Track.mixer_device.track_activator.value.
+
+        Accepts bool / 0|1 / 0.0|1.0. Distinct from Track.mute: this is a
+        DeviceParameter (automatable, has envelope/automation lane). Used
+        by Live's own ChannelStrip mute-button mapping.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            mixer = getattr(track, "mixer_device", None)
+            if mixer is None or not hasattr(mixer, "track_activator"):
+                raise Exception("Track has no mixer_device.track_activator")
+            param = mixer.track_activator
+            # Normalize value: bool/int/float -> {0.0, 1.0}
+            if isinstance(value, bool):
+                v = 1.0 if value else 0.0
+            else:
+                try:
+                    fv = float(value)
+                except (TypeError, ValueError):
+                    raise ValueError("value must be bool/0/1/0.0/1.0")
+                v = 1.0 if fv >= 0.5 else 0.0
+            param.value = v
+            return {
+                "ok": True,
+                "track_index": track_index,
+                "value": float(param.value),
+            }
+        except Exception as e:
+            self.log_message("Error set_track_activator: " + str(e))
+            raise
+
+    def _set_clip_markers(self, track_index, clip_index,
+                          start_marker=None, end_marker=None,
+                          location="session"):
+        """Set Clip.start_marker / Clip.end_marker. Either / both may be None.
+
+        Independent of loop_start/loop_end. Validates start < end (Live
+        otherwise no-ops or surfaces an error). If only one side is given,
+        validates against the existing other side. Writes start_marker
+        first when shrinking left, end_marker first when growing right —
+        Live rejects writes that would invert the range mid-operation.
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, location)
+            old_start = float(self._safe_get(clip, "start_marker", float) or 0.0)
+            old_end = float(self._safe_get(clip, "end_marker", float) or 0.0)
+            new_start = float(start_marker) if start_marker is not None else old_start
+            new_end = float(end_marker) if end_marker is not None else old_end
+            if new_end <= new_start:
+                raise ValueError(
+                    "end_marker ({0}) must be greater than start_marker ({1})".format(
+                        new_end, new_start))
+            # Order writes so we never transiently invert the range.
+            wrote = []
+            if new_start < old_start:
+                # Shrinking left edge first
+                if start_marker is not None:
+                    clip.start_marker = new_start
+                    wrote.append("start_marker")
+                if end_marker is not None:
+                    clip.end_marker = new_end
+                    wrote.append("end_marker")
+            else:
+                # Growing right (or moving right edge): write end first
+                if end_marker is not None:
+                    clip.end_marker = new_end
+                    wrote.append("end_marker")
+                if start_marker is not None:
+                    clip.start_marker = new_start
+                    wrote.append("start_marker")
+            return {
+                "ok": True,
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "location": str(location).lower(),
+                "old_start_marker": old_start,
+                "old_end_marker": old_end,
+                "start_marker": float(self._safe_get(clip, "start_marker", float) or 0.0),
+                "end_marker": float(self._safe_get(clip, "end_marker", float) or 0.0),
+                "wrote": wrote,
+            }
+        except Exception as e:
+            self.log_message("Error set_clip_markers: " + str(e))
+            raise
+
+    def _set_session_automation_record(self, enabled):
+        """Toggle Song.session_automation_record."""
+        try:
+            song = self._song
+            if not hasattr(song, "session_automation_record"):
+                raise Exception("Song.session_automation_record not exposed")
+            song.session_automation_record = bool(enabled)
+            return {
+                "ok": True,
+                "session_automation_record": bool(
+                    self._safe_get(song, "session_automation_record", bool)),
+            }
+        except Exception as e:
+            self.log_message("Error set_session_automation_record: " + str(e))
+            raise
+
+    def _get_exclusive_mode(self):
+        """Read Song.exclusive_arm / Song.exclusive_solo. Inline read."""
+        try:
+            song = self._song
+            return {
+                "exclusive_arm": bool(self._safe_get(song, "exclusive_arm", bool)),
+                "exclusive_solo": bool(self._safe_get(song, "exclusive_solo", bool)),
+            }
+        except Exception as e:
+            self.log_message("Error get_exclusive_mode: " + str(e))
+            raise
+
+    def _set_exclusive_mode(self, exclusive_arm=None, exclusive_solo=None):
+        """LIVE 12.3.7 LIMITATION: Song.exclusive_arm / exclusive_solo are
+        READ-ONLY at the pybind layer (verified empirically 2026-06-01:
+        write attempts return 'property of Song object has no setter').
+
+        These ARE writable user preferences but only via Live's Preferences
+        UI (Preferences > Record/Warp/Launch > Exclusive Arm / Exclusive
+        Solo), NOT via direct attribute set from the Remote Script.
+
+        The READ side (get_exclusive_mode + get_transport_state.exclusive_arm)
+        works fine — agents can detect the current setting and adjust their
+        arm/solo strategy accordingly, even if they can't toggle it.
+        """
+        raise NotImplementedError(
+            "Song.exclusive_arm/exclusive_solo are read-only on Live 12.3.7 "
+            "Remote Script (pybind: 'property of Song object has no setter'). "
+            "Use Preferences > Record/Warp/Launch to toggle. Read state via "
+            "get_exclusive_mode or get_transport_state.exclusive_arm.")
+        try:
+            song = self._song
+            before = {
+                "exclusive_arm": bool(self._safe_get(song, "exclusive_arm", bool)),
+                "exclusive_solo": bool(self._safe_get(song, "exclusive_solo", bool)),
+            }
+            wrote = []
+            if exclusive_arm is not None:
+                if not hasattr(song, "exclusive_arm"):
+                    raise Exception("Song.exclusive_arm not exposed")
+                song.exclusive_arm = bool(exclusive_arm)
+                wrote.append("exclusive_arm")
+            if exclusive_solo is not None:
+                if not hasattr(song, "exclusive_solo"):
+                    raise Exception("Song.exclusive_solo not exposed")
+                song.exclusive_solo = bool(exclusive_solo)
+                wrote.append("exclusive_solo")
+            after = {
+                "exclusive_arm": bool(self._safe_get(song, "exclusive_arm", bool)),
+                "exclusive_solo": bool(self._safe_get(song, "exclusive_solo", bool)),
+            }
+            return {
+                "ok": True,
+                "before": before,
+                "after": after,
+                "wrote": wrote,
+            }
+        except Exception as e:
+            self.log_message("Error set_exclusive_mode: " + str(e))
             raise
