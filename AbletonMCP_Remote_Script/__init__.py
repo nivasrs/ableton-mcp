@@ -5300,22 +5300,37 @@ class AbletonMCP(ControlSurface):
             if dest < 0:
                 raise ValueError("destination_time must be >= 0")
             source_name = getattr(source_clip, "name", "") or ""
-            # Snapshot before
-            before_ids = set(id(c) for c in track.arrangement_clips)
+            # Snapshot before — use (start_time, length, name) tuples since
+            # Live returns FRESH Python wrappers each access (id() doesn't match).
+            def _key(c):
+                return (round(float(getattr(c, "start_time", 0.0)), 6),
+                        round(float(getattr(c, "length", 0.0)), 6),
+                        getattr(c, "name", "") or "")
+            before_keys = []
+            for c in track.arrangement_clips:
+                before_keys.append(_key(c))
             new_clip = track.duplicate_clip_to_arrangement(source_clip, dest)
-            # Snapshot after — find the SINGLE new clip object
+            # Snapshot after — find the SINGLE new clip by tuple-diff. If
+            # source + duplicate share name/length/start (rare), fall back
+            # to "first clip at destination_time we haven't already matched".
             new_clips = list(track.arrangement_clips)
             new_idx = -1
+            remaining_before = list(before_keys)
             for i, c in enumerate(new_clips):
-                if id(c) not in before_ids:
+                k = _key(c)
+                if k in remaining_before:
+                    remaining_before.remove(k)
+                else:
                     new_idx = i
                     break
-            if new_idx == -1 and new_clip is not None:
-                # Fallback: identity match against returned clip
+            if new_idx == -1:
+                # Last-resort: closest clip to destination_time
+                best_dist = None
                 for i, c in enumerate(new_clips):
-                    if c is new_clip:
+                    d = abs(float(getattr(c, "start_time", 0.0)) - dest)
+                    if best_dist is None or d < best_dist:
+                        best_dist = d
                         new_idx = i
-                        break
             return {
                 "ok": True,
                 "track_index": track_index,
@@ -5509,12 +5524,23 @@ class AbletonMCP(ControlSurface):
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range (track_index)")
             track = self._song.tracks[track_index]
+            # Track.is_playing not exposed on Live 12.3.7 LOM (verified
+            # 2026-06-01 smoke). Derive from clip-slot states instead:
+            # True iff any clip in the track's session slots is_playing.
+            is_playing = False
+            try:
+                for slot in track.clip_slots:
+                    if slot.has_clip and bool(getattr(slot.clip, "is_playing", False)):
+                        is_playing = True
+                        break
+            except Exception:
+                pass
             return {
                 "track_index": track_index,
                 "name": self._safe_get(track, "name"),
                 "fired_slot_index": self._safe_get(track, "fired_slot_index", int),
                 "playing_slot_index": self._safe_get(track, "playing_slot_index", int),
-                "is_playing": self._safe_get(track, "is_playing", bool),
+                "is_playing": is_playing,
             }
         except Exception as e:
             self.log_message("Error get_track_playback_state: " + str(e))
@@ -5566,7 +5592,10 @@ class AbletonMCP(ControlSurface):
             if fp + ps > 128:
                 raise ValueError(
                     "from_pitch + pitch_span must be <= 128 (got {0} + {1})".format(fp, ps))
-            clip.remove_notes_extended(ft, fp, ts, ps)
+            # Live 12.3.7 actual signature is (from_pitch, pitch_span,
+            # from_time, time_span) — verified empirically 2026-06-01.
+            # The probe report had the order reversed.
+            clip.remove_notes_extended(fp, ps, ft, ts)
             return {
                 "ok": True,
                 "track_index": track_index,
@@ -5600,7 +5629,8 @@ class AbletonMCP(ControlSurface):
                 ts = float(time_span)
                 if ts <= 0:
                     raise ValueError("time_span must be > 0")
-            clip.remove_notes_extended(ft, p, ts, 1)
+            # Signature is (from_pitch, pitch_span, from_time, time_span).
+            clip.remove_notes_extended(p, 1, ft, ts)
             return {
                 "ok": True,
                 "track_index": track_index,
