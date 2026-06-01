@@ -154,6 +154,12 @@ class AbletonConnection:
             "set_clip_launch_settings", "set_clip_follow_action",
             # Warp markers (2026-05-17)
             "add_warp_marker", "remove_warp_marker", "move_warp_marker",
+            # Option-A batch (2026-06-01) — mutating commands only
+            "duplicate_arrangement_clip",
+            "begin_undo_step", "end_undo_step",
+            "set_focused_view", "set_view_visible",
+            "delete_notes_in_range", "delete_notes_with_pitch",
+            "duplicate_clip_loop",
         ]
         
         try:
@@ -3615,6 +3621,345 @@ def move_warp_marker(
     except Exception as e:
         logger.error(f"Error moving warp marker: {e}")
         return f"Error moving warp marker: {e}"
+
+
+# ----------------------------------------------------------------------
+# Option-A batch (2026-06-01): 11 tools across 6 LOM families surfaced
+# by the AbletonLive12_MIDIRemoteScripts survey workflow.
+# ----------------------------------------------------------------------
+
+@mcp.tool()
+def duplicate_arrangement_clip(
+    ctx: Context,
+    track_index: int,
+    source_arrangement_clip_index: int,
+    destination_time: float,
+) -> str:
+    """
+    Clone an arrangement-view clip at a new beat position on the same track
+    via Live's Track.duplicate_clip_to_arrangement(clip, beat).
+
+    Lossless alternative to delete+recreate — Live copies the source clip's
+    content, warp markers, automation, and envelopes wholesale. This is
+    THE correct path for arrangement-clip mutation (the older delete+recreate
+    pattern in set_arrangement_clip_position is lossy on audio clips).
+
+    Parameters:
+    - track_index: 0-based track index (source + destination on same track).
+    - source_arrangement_clip_index: index into track.arrangement_clips.
+    - destination_time: target start time in beats (0 = song start).
+
+    Returns the new clip's resolved index in track.arrangement_clips (via
+    object-identity diff before/after — guaranteed unique even with same
+    name/start-time collisions).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("duplicate_arrangement_clip", {
+            "track_index": track_index,
+            "source_arrangement_clip_index": source_arrangement_clip_index,
+            "destination_time": float(destination_time),
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error duplicating arrangement clip: {e}")
+        return f"Error duplicating arrangement clip: {e}"
+
+
+@mcp.tool()
+def begin_undo_step(ctx: Context) -> str:
+    """
+    Open an undo-history boundary so the next batch of edits coalesces
+    into a single undoable step.
+
+    CRITICAL: caller MUST pair with end_undo_step before returning control
+    to the user. An unbalanced begin leaves the undo stack OPEN, so the
+    user's NEXT manual edit will get folded into the script's undo step —
+    Cmd-Z then undoes both the script batch AND the user's last manual
+    action.
+
+    Use before any multi-step write batch (Tier 2 layered apply, arrangement
+    build, bulk note edits) so one Cmd-Z restores the prior state.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("begin_undo_step", {})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error begin_undo_step: {e}")
+        return f"Error begin_undo_step: {e}"
+
+
+@mcp.tool()
+def end_undo_step(ctx: Context) -> str:
+    """
+    Close the undo-history boundary opened by begin_undo_step.
+
+    Always call after a batch of writes that opened a boundary, so the
+    user's subsequent manual edits get their own undo step (instead of
+    being folded into the script's batch).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("end_undo_step", {})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error end_undo_step: {e}")
+        return f"Error end_undo_step: {e}"
+
+
+@mcp.tool()
+def get_focused_view(ctx: Context) -> str:
+    """
+    Read Application.View.focused_document_view + visibility of the main
+    panels.
+
+    On Live 12.3.7, focused_document_view returns ONE of: 'Session',
+    'Arranger' (these are the two main document views — auxiliary panels
+    like Browser/Detail don't take document focus). The returned visibility
+    map reports show/hide state for Browser, Arranger, Session, Detail,
+    Detail/Clip, Detail/DeviceChain.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_focused_view", {})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error get_focused_view: {e}")
+        return f"Error get_focused_view: {e}"
+
+
+@mcp.tool()
+def set_focused_view(ctx: Context, view_name: str) -> str:
+    """
+    Bring a Live document view to the front via Application.View.show_view(name).
+
+    Valid view_name values (canonical from view_control.py):
+      'Browser', 'Arranger', 'Session', 'Detail',
+      'Detail/Clip', 'Detail/DeviceChain'.
+
+    Note: the canonical name is 'Arranger' (NOT 'Arrangement'). The common
+    'Arrangement' misspelling is auto-corrected for convenience; the
+    response includes 'auto_corrected': True when this happens.
+
+    The 'focused_view' field in the response reflects only the main document
+    panel (Session/Arranger) — not auxiliary panels like Browser or Detail.
+    Use the 'is_visible' field to confirm whether the requested view was
+    actually shown.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_focused_view", {
+            "view_name": view_name,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error set_focused_view: {e}")
+        return f"Error set_focused_view: {e}"
+
+
+@mcp.tool()
+def set_view_visible(ctx: Context, view_name: str, visible: bool) -> str:
+    """
+    Show or hide a named document view via Application.View.show_view
+    or hide_view.
+
+    Parameters:
+    - view_name: same canonical names as set_focused_view.
+    - visible: True to show, False to hide.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_view_visible", {
+            "view_name": view_name,
+            "visible": bool(visible),
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error set_view_visible: {e}")
+        return f"Error set_view_visible: {e}"
+
+
+@mcp.tool()
+def get_clip_playing_state(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    location: str = "session",
+) -> str:
+    """
+    Read live playback state for a clip: playing_position, is_playing,
+    is_triggered, is_recording, plus length/loop region.
+
+    Parameters:
+    - track_index: 0-based.
+    - clip_index: session slot index (location='session') OR
+                  arrangement_clips index (location='arrangement').
+    - location: 'session' (default) or 'arrangement'.
+
+    Returns {has_clip: False, ...} for empty session slots / out-of-range
+    arrangement_clips index — poll callers shouldn't have to wrap every
+    call in try/except just because the user emptied a slot mid-poll.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_clip_playing_state", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "location": location,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error get_clip_playing_state: {e}")
+        return f"Error get_clip_playing_state: {e}"
+
+
+@mcp.tool()
+def get_track_playback_state(ctx: Context, track_index: int) -> str:
+    """
+    Read Track-level session playback indices:
+      - fired_slot_index: -2 = "stop clip pending", -1 = nothing fired,
+                          >=0 = slot whose clip is queued.
+      - playing_slot_index: >=0 = slot of currently-playing clip, <0 none.
+      - is_playing: Track-level audio activity.
+
+    Use to discover which session clip is currently playing on a track
+    without polling each clip_slot's is_triggered/is_playing.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_playback_state", {
+            "track_index": track_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error get_track_playback_state: {e}")
+        return f"Error get_track_playback_state: {e}"
+
+
+@mcp.tool()
+def delete_notes_in_range(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    from_time: float,
+    time_span: float,
+    from_pitch: int = 0,
+    pitch_span: int = 128,
+    location: str = "session",
+) -> str:
+    """
+    Delete every MIDI note inside a (time, pitch) rectangle via
+    Clip.remove_notes_extended.
+
+    Defaults nuke ALL pitches (from_pitch=0, pitch_span=128) in the
+    given time range — the same idiom Live's own components use for
+    whole-page clears. Pass narrower from_pitch/pitch_span to scope.
+
+    Parameters:
+    - track_index: 0-based.
+    - clip_index: session slot OR arrangement_clips index.
+    - from_time: start beat of the rectangle.
+    - time_span: beat-width (must be > 0).
+    - from_pitch: lowest MIDI pitch to clear (0..127, default 0).
+    - pitch_span: semitones to clear (default 128 = all). from_pitch +
+                  pitch_span must be <= 128.
+    - location: 'session' (default) or 'arrangement'.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_notes_in_range", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "from_time": float(from_time),
+            "time_span": float(time_span),
+            "from_pitch": int(from_pitch),
+            "pitch_span": int(pitch_span),
+            "location": location,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error delete_notes_in_range: {e}")
+        return f"Error delete_notes_in_range: {e}"
+
+
+@mcp.tool()
+def delete_notes_with_pitch(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    pitch: int,
+    from_time: float = 0.0,
+    time_span: float = None,
+    location: str = "session",
+) -> str:
+    """
+    Delete every note at a single MIDI pitch from a clip. Convenience
+    over delete_notes_in_range with pitch_span=1.
+
+    Parameters:
+    - track_index: 0-based.
+    - clip_index: session slot OR arrangement_clips index.
+    - pitch: MIDI pitch 0..127 (e.g. 36 = C1 kick).
+    - from_time: start beat (default 0).
+    - time_span: beat-width (omit / None = full clip length).
+    - location: 'session' (default) or 'arrangement'.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "pitch": int(pitch),
+            "from_time": float(from_time),
+            "location": location,
+        }
+        if time_span is not None:
+            params["time_span"] = float(time_span)
+        result = ableton.send_command("delete_notes_with_pitch", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error delete_notes_with_pitch: {e}")
+        return f"Error delete_notes_with_pitch: {e}"
+
+
+@mcp.tool()
+def duplicate_clip_loop(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    location: str = "session",
+) -> str:
+    """
+    Doubles the looped region of a clip in place via Clip.duplicate_loop().
+
+    Live copies content from [loop_start, loop_end) to
+    [loop_end, 2*loop_end - loop_start) and extends loop_end + end_marker
+    accordingly. Pre-checks Clip.looping == True; raises if loop mode
+    is off.
+
+    WARNING: if duplicating would exceed Live's max clip length, Live may
+    surface a UI dialog that blocks the Remote Script main thread → the
+    call times out at 15s. Pre-check old_length for very long clips.
+
+    Parameters:
+    - track_index: 0-based.
+    - clip_index: session slot OR arrangement_clips index.
+    - location: 'session' (default) or 'arrangement'.
+
+    Returns old/new length + loop region for verification.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("duplicate_clip_loop", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "location": location,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error duplicate_clip_loop: {e}")
+        return f"Error duplicate_clip_loop: {e}"
 
 
 # Main execution

@@ -384,7 +384,17 @@ class AbletonMCP(ControlSurface):
                                  # Gap-fill batch (2026-05-21)
                                  "snap_clip_to_scale",
                                  "shape_clip_velocities",
-                                 "set_cue_point_name"]:
+                                 "set_cue_point_name",
+                                 # Option-A batch (2026-06-01)
+                                 "duplicate_arrangement_clip",
+                                 "begin_undo_step", "end_undo_step",
+                                 "get_focused_view", "set_focused_view",
+                                 "set_view_visible",
+                                 "get_clip_playing_state",
+                                 "get_track_playback_state",
+                                 "delete_notes_in_range",
+                                 "delete_notes_with_pitch",
+                                 "duplicate_clip_loop"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -833,6 +843,55 @@ class AbletonMCP(ControlSurface):
                             result = self._set_cue_point_name(
                                 params.get("cue_index", 0),
                                 params.get("name", ""))
+                        # Option-A batch (2026-06-01)
+                        elif command_type == "duplicate_arrangement_clip":
+                            result = self._duplicate_arrangement_clip(
+                                params.get("track_index", 0),
+                                params.get("source_arrangement_clip_index", 0),
+                                params.get("destination_time", 0.0))
+                        elif command_type == "begin_undo_step":
+                            result = self._begin_undo_step()
+                        elif command_type == "end_undo_step":
+                            result = self._end_undo_step()
+                        elif command_type == "get_focused_view":
+                            result = self._get_focused_view()
+                        elif command_type == "set_focused_view":
+                            result = self._set_focused_view(
+                                params.get("view_name"))
+                        elif command_type == "set_view_visible":
+                            result = self._set_view_visible(
+                                params.get("view_name"),
+                                params.get("visible", True))
+                        elif command_type == "get_clip_playing_state":
+                            result = self._get_clip_playing_state(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("location", "session"))
+                        elif command_type == "get_track_playback_state":
+                            result = self._get_track_playback_state(
+                                params.get("track_index", 0))
+                        elif command_type == "delete_notes_in_range":
+                            result = self._delete_notes_in_range(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("from_time", 0.0),
+                                params.get("time_span", 0.0),
+                                params.get("from_pitch", 0),
+                                params.get("pitch_span", 128),
+                                params.get("location", "session"))
+                        elif command_type == "delete_notes_with_pitch":
+                            result = self._delete_notes_with_pitch(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("pitch", 60),
+                                params.get("from_time", 0.0),
+                                params.get("time_span"),
+                                params.get("location", "session"))
+                        elif command_type == "duplicate_clip_loop":
+                            result = self._duplicate_clip_loop(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("location", "session"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -5205,4 +5264,386 @@ class AbletonMCP(ControlSurface):
                 raise ValueError("Unknown kind '{0}'. Use track/return/master/scene/clip".format(kind))
         except Exception as e:
             self.log_message("Error setting selection: " + str(e))
+            raise
+
+    # ----------------------------------------------------------------
+    # Option-A batch (2026-06-01): arrangement-clip duplicate, undo
+    # boundary, view control, playback-state reads, note-range delete,
+    # loop-doubling. Six families wrapping LOM primitives surfaced by
+    # the AbletonLive12_MIDIRemoteScripts survey workflow wb6doe9o9.
+    # ----------------------------------------------------------------
+
+    def _duplicate_arrangement_clip(self, track_index, source_arrangement_clip_index,
+                                     destination_time):
+        """Clone an arrangement clip to destination_time via
+        Track.duplicate_clip_to_arrangement(clip, beat).
+
+        Source is addressed via track.arrangement_clips[N]. Uses a
+        snapshot-before / snapshot-after diff to resolve the new clip's
+        index (avoids ambiguity when source + dest share name OR
+        adjacent start_times).
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range (track_index)")
+            track = self._song.tracks[track_index]
+            if not hasattr(track, "duplicate_clip_to_arrangement"):
+                raise NotImplementedError(
+                    "Track.duplicate_clip_to_arrangement not exposed on this Live build")
+            clips = getattr(track, "arrangement_clips", None) or ()
+            if source_arrangement_clip_index < 0 or source_arrangement_clip_index >= len(clips):
+                raise IndexError(
+                    "source_arrangement_clip_index out of range (0..{0})".format(
+                        len(clips) - 1))
+            source_clip = clips[source_arrangement_clip_index]
+            dest = float(destination_time)
+            if dest < 0:
+                raise ValueError("destination_time must be >= 0")
+            source_name = getattr(source_clip, "name", "") or ""
+            # Snapshot before
+            before_ids = set(id(c) for c in track.arrangement_clips)
+            new_clip = track.duplicate_clip_to_arrangement(source_clip, dest)
+            # Snapshot after — find the SINGLE new clip object
+            new_clips = list(track.arrangement_clips)
+            new_idx = -1
+            for i, c in enumerate(new_clips):
+                if id(c) not in before_ids:
+                    new_idx = i
+                    break
+            if new_idx == -1 and new_clip is not None:
+                # Fallback: identity match against returned clip
+                for i, c in enumerate(new_clips):
+                    if c is new_clip:
+                        new_idx = i
+                        break
+            return {
+                "ok": True,
+                "track_index": track_index,
+                "source_clip_index": source_arrangement_clip_index,
+                "new_clip_index": new_idx,
+                "destination_time": dest,
+                "name": getattr(new_clip, "name", source_name) if new_clip else source_name,
+            }
+        except Exception as e:
+            self.log_message("Error duplicating arrangement clip: " + str(e))
+            raise
+
+    def _begin_undo_step(self):
+        """Open an undo boundary via Song.begin_undo_step().
+
+        CRITICAL: caller MUST pair with end_undo_step before returning
+        control to the user. An unbalanced begin leaves the undo stack
+        OPEN, so the user's NEXT manual edit gets folded into the
+        script's undo step — Cmd-Z then undoes both the script batch
+        AND the user's last manual action.
+        """
+        try:
+            self._song.begin_undo_step()
+            return {"ok": True, "action": "begin_undo_step"}
+        except Exception as e:
+            self.log_message("Error begin_undo_step: " + str(e))
+            raise
+
+    def _end_undo_step(self):
+        """Close the current undo boundary opened by begin_undo_step.
+
+        Always call after a batch of writes that opened a boundary, so
+        the user's subsequent manual edits get their own undo step.
+        """
+        try:
+            self._song.end_undo_step()
+            return {"ok": True, "action": "end_undo_step"}
+        except Exception as e:
+            self.log_message("Error end_undo_step: " + str(e))
+            raise
+
+    # Canonical view names per AbletonLive12_MIDIRemoteScripts/ableton/v2/
+    # control_surface/components/view_control.py. Live 12 uses 'Arranger'
+    # (NOT 'Arrangement') — 'Arrangement' is auto-corrected for convenience.
+    _ALLOWED_VIEWS = (
+        "Browser", "Arranger", "Session", "Detail",
+        "Detail/Clip", "Detail/DeviceChain",
+    )
+
+    def _resolve_view_name(self, view_name):
+        """Validate + canonicalize a view name. Returns (canonical_name, view).
+
+        If Application.View.available_main_views is exposed at runtime,
+        merge its names with the static allow-list. Auto-corrects the
+        common 'Arrangement' typo to 'Arranger'.
+        """
+        if view_name is None:
+            raise ValueError("view_name is required")
+        name = str(view_name)
+        if name == "Arrangement":
+            name = "Arranger"
+        view = Live.Application.get_application().view
+        valid = set(self._ALLOWED_VIEWS)
+        try:
+            runtime = getattr(view, "available_main_views", None)
+            if runtime:
+                runtime_names = runtime() if callable(runtime) else runtime
+                if runtime_names:
+                    valid = set(runtime_names) | valid
+        except Exception:
+            pass
+        if name not in valid:
+            raise ValueError(
+                "Unknown view_name '{0}'. Valid: {1}".format(
+                    view_name, sorted(valid)))
+        return name, view
+
+    def _get_focused_view(self):
+        """Read Application.View.focused_document_view + visibility of
+        the main panels. focused_document_view returns 'Session' or
+        'Arranger' (main document only — not Browser/Detail).
+        """
+        try:
+            view = Live.Application.get_application().view
+            focused = getattr(view, "focused_document_view", None)
+            visibility = {}
+            for v in self._ALLOWED_VIEWS:
+                try:
+                    visibility[v] = bool(view.is_view_visible(v))
+                except Exception:
+                    visibility[v] = None
+            return {
+                "focused_view": focused,
+                "visibility": visibility,
+            }
+        except Exception as e:
+            self.log_message("Error get_focused_view: " + str(e))
+            raise
+
+    def _set_focused_view(self, view_name):
+        """Bring view_name to front via Application.View.show_view(name)."""
+        try:
+            name, view = self._resolve_view_name(view_name)
+            auto_corrected = (str(view_name) == "Arrangement")
+            view.show_view(name)
+            return {
+                "ok": True,
+                "view_name": name,
+                "auto_corrected": auto_corrected,
+                "is_visible": bool(view.is_view_visible(name)),
+                "focused_view": getattr(view, "focused_document_view", None),
+            }
+        except Exception as e:
+            self.log_message("Error set_focused_view: " + str(e))
+            raise
+
+    def _set_view_visible(self, view_name, visible):
+        """show_view(name) if visible truthy, else hide_view(name)."""
+        try:
+            name, view = self._resolve_view_name(view_name)
+            vis = bool(visible)
+            if vis:
+                view.show_view(name)
+            else:
+                view.hide_view(name)
+            return {
+                "ok": True,
+                "view_name": name,
+                "visible": bool(view.is_view_visible(name)),
+            }
+        except Exception as e:
+            self.log_message("Error set_view_visible: " + str(e))
+            raise
+
+    def _get_clip_playing_state(self, track_index, clip_index, location="session"):
+        """Read clip-level playback state. location='session' addresses
+        track.clip_slots[N]; 'arrangement' addresses track.arrangement_clips[N].
+
+        Returns {has_clip: False, ...} for empty session slots instead of
+        raising — poll callers shouldn't have to try/except every call.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range (track_index)")
+            track = self._song.tracks[track_index]
+            if str(location).lower() == "arrangement":
+                clips = getattr(track, "arrangement_clips", None) or ()
+                if clip_index < 0 or clip_index >= len(clips):
+                    return {
+                        "track_index": track_index, "clip_index": clip_index,
+                        "location": "arrangement", "has_clip": False,
+                    }
+                clip = clips[clip_index]
+            else:
+                if clip_index < 0 or clip_index >= len(track.clip_slots):
+                    raise IndexError("clip_index out of range (clip_slots)")
+                slot = track.clip_slots[clip_index]
+                if not slot.has_clip:
+                    return {
+                        "track_index": track_index, "clip_index": clip_index,
+                        "location": "session", "has_clip": False,
+                    }
+                clip = slot.clip
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "location": str(location).lower(),
+                "has_clip": True,
+                "playing_position": self._safe_get(clip, "playing_position", float),
+                "is_playing": self._safe_get(clip, "is_playing", bool),
+                "is_triggered": self._safe_get(clip, "is_triggered", bool),
+                "is_recording": self._safe_get(clip, "is_recording", bool),
+                "length": self._safe_get(clip, "length", float),
+                "loop_start": self._safe_get(clip, "loop_start", float),
+                "loop_end": self._safe_get(clip, "loop_end", float),
+                "is_midi_clip": self._safe_get(clip, "is_midi_clip", bool),
+                "name": self._safe_get(clip, "name"),
+            }
+        except Exception as e:
+            self.log_message("Error get_clip_playing_state: " + str(e))
+            raise
+
+    def _get_track_playback_state(self, track_index):
+        """Read Track-level session playback indices.
+
+        fired_slot_index: -2 = "stop clip pending", -1 = nothing fired,
+                          >=0 = slot whose clip is queued.
+        playing_slot_index: >=0 = slot of currently-playing clip, <0 none.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range (track_index)")
+            track = self._song.tracks[track_index]
+            return {
+                "track_index": track_index,
+                "name": self._safe_get(track, "name"),
+                "fired_slot_index": self._safe_get(track, "fired_slot_index", int),
+                "playing_slot_index": self._safe_get(track, "playing_slot_index", int),
+                "is_playing": self._safe_get(track, "is_playing", bool),
+            }
+        except Exception as e:
+            self.log_message("Error get_track_playback_state: " + str(e))
+            raise
+
+    def _resolve_clip(self, track_index, clip_index, location):
+        """Helper: address either a session or arrangement clip. Raises
+        on missing/out-of-range. Used by delete_notes_* + duplicate_clip_loop.
+        """
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range (track_index)")
+        track = self._song.tracks[track_index]
+        if str(location).lower() == "arrangement":
+            clips = getattr(track, "arrangement_clips", None) or ()
+            if clip_index < 0 or clip_index >= len(clips):
+                raise IndexError("clip_index out of range (arrangement_clips)")
+            return track, clips[clip_index]
+        if clip_index < 0 or clip_index >= len(track.clip_slots):
+            raise IndexError("clip_index out of range (clip_slots)")
+        slot = track.clip_slots[clip_index]
+        if not slot.has_clip:
+            raise Exception("No clip in session slot {0} of track {1}".format(
+                clip_index, track_index))
+        return track, slot.clip
+
+    def _delete_notes_in_range(self, track_index, clip_index, from_time, time_span,
+                                from_pitch=0, pitch_span=128, location="session"):
+        """Clip.remove_notes_extended over a (time, pitch) rectangle.
+
+        Defaults nuke ALL pitches (from_pitch=0, pitch_span=128) in the
+        given time range. Pass narrower from_pitch/pitch_span to scope.
+        Positional order verified per Live's own __init__.py:1093:
+        (from_time, from_pitch, time_span, pitch_span).
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, location)
+            if not bool(getattr(clip, "is_midi_clip", False)):
+                raise Exception("Clip is not a MIDI clip — cannot delete notes")
+            ft = float(from_time)
+            ts = float(time_span)
+            if ts <= 0:
+                raise ValueError("time_span must be > 0")
+            fp = int(from_pitch)
+            ps = int(pitch_span)
+            if fp < 0 or fp > 127:
+                raise ValueError("from_pitch must be in 0..127")
+            if ps <= 0:
+                raise ValueError("pitch_span must be > 0")
+            if fp + ps > 128:
+                raise ValueError(
+                    "from_pitch + pitch_span must be <= 128 (got {0} + {1})".format(fp, ps))
+            clip.remove_notes_extended(ft, fp, ts, ps)
+            return {
+                "ok": True,
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "location": str(location).lower(),
+                "from_time": ft,
+                "time_span": ts,
+                "from_pitch": fp,
+                "pitch_span": ps,
+            }
+        except Exception as e:
+            self.log_message("Error delete_notes_in_range: " + str(e))
+            raise
+
+    def _delete_notes_with_pitch(self, track_index, clip_index, pitch,
+                                  from_time=0.0, time_span=None, location="session"):
+        """Delete every note at a single pitch over a time range.
+        time_span=None means full clip length.
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, location)
+            if not bool(getattr(clip, "is_midi_clip", False)):
+                raise Exception("Clip is not a MIDI clip — cannot delete notes")
+            p = int(pitch)
+            if p < 0 or p > 127:
+                raise ValueError("pitch must be in 0..127")
+            ft = float(from_time)
+            if time_span is None:
+                ts = max(float(getattr(clip, "length", 0.0)), 1.0)
+            else:
+                ts = float(time_span)
+                if ts <= 0:
+                    raise ValueError("time_span must be > 0")
+            clip.remove_notes_extended(ft, p, ts, 1)
+            return {
+                "ok": True,
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "location": str(location).lower(),
+                "pitch": p,
+                "from_time": ft,
+                "time_span": ts,
+            }
+        except Exception as e:
+            self.log_message("Error delete_notes_with_pitch: " + str(e))
+            raise
+
+    def _duplicate_clip_loop(self, track_index, clip_index, location="session"):
+        """Clip.duplicate_loop() — doubles the looped region in place.
+
+        Pre-checks clip.looping; raises ValueError if loop mode is off
+        (Live's duplicate_loop on a non-looping clip raises an opaque
+        runtime error). WARNING: very long clips may trigger a UI dialog
+        which blocks the main thread; pre-check old_length for safety.
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, location)
+            if not bool(getattr(clip, "looping", False)):
+                raise ValueError(
+                    "Clip is not in loop mode — enable looping (Clip.looping=True) "
+                    "or use set_clip_loop_region first")
+            old_length = float(self._safe_get(clip, "length", float) or 0.0)
+            old_loop_start = float(self._safe_get(clip, "loop_start", float) or 0.0)
+            old_loop_end = float(self._safe_get(clip, "loop_end", float) or 0.0)
+            clip.duplicate_loop()
+            return {
+                "ok": True,
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "location": str(location).lower(),
+                "old_length": old_length,
+                "new_length": float(self._safe_get(clip, "length", float) or 0.0),
+                "old_loop_start": old_loop_start,
+                "old_loop_end": old_loop_end,
+                "new_loop_start": float(self._safe_get(clip, "loop_start", float) or 0.0),
+                "new_loop_end": float(self._safe_get(clip, "loop_end", float) or 0.0),
+            }
+        except Exception as e:
+            self.log_message("Error duplicate_clip_loop: " + str(e))
             raise
