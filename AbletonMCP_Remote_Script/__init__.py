@@ -1291,15 +1291,54 @@ class AbletonMCP(ControlSurface):
             raise IndexError("Device index out of range")
         return track, track.devices[device_index]
 
+    # Live.DeviceParameter.AutomationState (LomTypes.py:854): the enum behind
+    # param.automation_state. 0 = no automation, 1 = playing automation,
+    # 2 = overridden (a manual move during playback; re_enable_automation reverts).
+    _AUTOMATION_STATE_NAMES = {0: "none", 1: "playing", 2: "overridden"}
+
     def _param_info(self, param, index):
-        return {
+        """Format one DeviceParameter. Beyond the raw numeric value/min/max,
+        surfaces the unit-context fields that prevent the normalized-vs-Hz /
+        wrong-enum-index recipe failures: the value Live actually DISPLAYS
+        (display_value via str_for_value), the legal enum options (value_items,
+        for quantized params), is_quantized, default_value, and automation_state.
+        All extras are best-effort — guarded so a binding that lacks one (older
+        Live, or a param whose str_for_value raises) never breaks the read."""
+        info = {
             "index": index,
             "name": param.name,
             "value": param.value,
             "min": param.min,
             "max": param.max,
             "is_enabled": param.is_enabled,
+            "is_quantized": bool(getattr(param, "is_quantized", False)),
         }
+        # The human-readable value (e.g. "440 Hz", "-6.0 dB", "2:1", "Sine").
+        # str_for_value is a native method call(value)->str that CAN raise.
+        try:
+            info["display_value"] = param.str_for_value(param.value)
+        except Exception:
+            info["display_value"] = None
+        # Legal discrete options — only meaningful for quantized (enum) params.
+        if info["is_quantized"]:
+            try:
+                info["value_items"] = [str(v) for v in param.value_items]
+            except Exception:
+                info["value_items"] = None
+        # default_value is a property whose GETTER raises ("no default value
+        # available for this type of parameter") for non-defaultable params —
+        # getattr-with-default does NOT catch that, so wrap in try/except.
+        try:
+            info["default_value"] = param.default_value
+        except Exception:
+            pass
+        try:
+            st = int(param.automation_state)
+            info["automation_state"] = st
+            info["automation_state_name"] = self._AUTOMATION_STATE_NAMES.get(st, str(st))
+        except Exception:
+            pass
+        return info
 
     def _get_device_parameters(self, track_index, device_index):
         """List all parameters on a device."""
@@ -1329,22 +1368,55 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _set_device_parameter(self, track_index, device_index, parameter, value):
-        """Set a device parameter, clamped to [min, max]."""
+        """Set a device parameter, clamped to [min, max].
+
+        For a QUANTIZED (enum) parameter, `value` may be either the numeric
+        index OR the discrete-state LABEL string (case-insensitive, matched
+        against value_items) — so callers can set 'Sine' / 'Complex Pro' / '4:1'
+        by name without first looking up its index. The response echoes
+        display_value (what Live shows) and matched_label when a label was used.
+        """
         try:
             _, device = self._get_device(track_index, device_index)
             param, index = self._resolve_parameter(device, parameter)
             if not param.is_enabled:
                 raise Exception("Parameter '{0}' is not enabled".format(param.name))
-            clamped = max(param.min, min(param.max, float(value)))
+            is_quantized = bool(getattr(param, "is_quantized", False))
+            matched_label = None
+            if is_quantized and isinstance(value, str):
+                try:
+                    items = [str(v) for v in param.value_items]
+                except Exception:
+                    items = []
+                lowered = [it.lower() for it in items]
+                key = value.strip().lower()
+                if key not in lowered:
+                    raise Exception(
+                        "'{0}' is not a valid option for quantized parameter "
+                        "'{1}'. Options: {2}".format(value, param.name, items))
+                pos = lowered.index(key)
+                matched_label = items[pos]
+                target = float(pos)
+            else:
+                target = float(value)
+            clamped = max(param.min, min(param.max, target))
             param.value = clamped
-            return {
+            result = {
                 "track_index": track_index,
                 "device_index": device_index,
                 "parameter_index": index,
                 "name": param.name,
                 "value": param.value,
-                "clamped": clamped != float(value),
+                "clamped": clamped != target,
+                "is_quantized": is_quantized,
             }
+            try:
+                result["display_value"] = param.str_for_value(param.value)
+            except Exception:
+                pass
+            if matched_label is not None:
+                result["matched_label"] = matched_label
+            return result
         except Exception as e:
             self.log_message("Error setting device parameter: " + str(e))
             raise

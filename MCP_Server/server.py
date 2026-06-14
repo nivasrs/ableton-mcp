@@ -476,7 +476,13 @@ def get_device_parameters(ctx: Context, track_index: int, device_index: int) -> 
     - track_index: Index of the track containing the device
     - device_index: Index of the device on that track (as returned by get_track_info)
 
-    Returns JSON list of {index, name, value, min, max, is_enabled}.
+    Returns JSON per parameter with: index, name, value, min, max, is_enabled,
+    is_quantized, display_value (the human-readable value Live shows, e.g.
+    "440 Hz" / "-6.0 dB" / "2:1"), value_items (legal enum option strings, for
+    quantized params), default_value, and automation_state(_name). Use
+    display_value to avoid the normalized-vs-Hz trap and value_items to discover
+    the legal options for enum parameters (then set by label via
+    set_device_parameter).
     """
     try:
         ableton = get_ableton_connection()
@@ -524,7 +530,7 @@ def set_device_parameter(
     track_index: int,
     device_index: int,
     parameter: Union[int, str],
-    value: float,
+    value: Union[float, str],
 ) -> str:
     """
     Set a device parameter to a given value.
@@ -533,7 +539,11 @@ def set_device_parameter(
     - track_index: Index of the track containing the device
     - device_index: Index of the device on that track
     - parameter: Parameter index (int) or name (str, e.g. "Width")
-    - value: Target value; will be clamped to the parameter's [min, max] range
+    - value: Target value. For continuous params, a number (clamped to
+      [min, max]). For QUANTIZED (enum) params you may pass the option LABEL as
+      a string (e.g. "Sine", "Complex Pro", "4:1") — it's matched case-
+      insensitively against value_items — or the numeric index. Get the legal
+      labels from get_device_parameters' value_items.
     """
     try:
         ableton = get_ableton_connection()
@@ -543,8 +553,10 @@ def set_device_parameter(
             "parameter": parameter,
             "value": value,
         })
+        shown = result.get("display_value")
+        suffix = f" ({shown})" if shown else ""
         return (f"Set {result.get('name', parameter)} on track {track_index} "
-                f"device {device_index} to {result.get('value', value)}")
+                f"device {device_index} to {result.get('value', value)}{suffix}")
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
         return f"Error setting device parameter: {str(e)}"
