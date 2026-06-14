@@ -323,7 +323,8 @@ class AbletonMCP(ControlSurface):
             # These commands must run on the main thread (writes + note reads)
             elif command_type in ["get_clip_notes",
                                  "create_midi_track", "set_track_name",
-                                 "create_clip", "add_notes_to_clip", "set_clip_name",
+                                 "create_clip", "create_audio_clip",
+                                 "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback", "load_browser_item",
                                  "set_device_parameter", "set_mixer_value",
@@ -432,6 +433,11 @@ class AbletonMCP(ControlSurface):
                             clip_index = params.get("clip_index", 0)
                             length = params.get("length", 4.0)
                             result = self._create_clip(track_index, clip_index, length)
+                        elif command_type == "create_audio_clip":
+                            result = self._create_audio_clip_in_slot(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("file_path"))
                         elif command_type == "add_notes_to_clip":
                             track_index = params.get("track_index", 0)
                             clip_index = params.get("clip_index", 0)
@@ -1146,7 +1152,68 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error creating clip: " + str(e))
             raise
-    
+
+    def _create_audio_clip_in_slot(self, track_index, clip_index, file_path):
+        """Import an audio FILE into a SESSION clip slot via
+        ClipSlot.create_audio_clip. Distinct from create_clip (MIDI session
+        clip) and create_arrangement_clip_from_session (arrangement). Lets an
+        agent drop a stem / texture / render / one-shot straight into the
+        launcher without manual drag-drop — the placement primitive the
+        sample-acquisition workflow needs.
+        """
+        import os
+        try:
+            if not file_path:
+                raise Exception("file_path is required")
+            fp = os.path.expanduser(file_path)
+            if not os.path.isabs(fp):
+                raise Exception("file_path must be absolute: " + str(file_path))
+            if not os.path.exists(fp):
+                raise Exception("audio file not found: " + fp)
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("track_index {0} out of range".format(track_index))
+            track = self._song.tracks[track_index]
+            # Only audio tracks hold audio clips. MIDI tracks expose
+            # has_midi_input; reject those with a clear message.
+            if bool(getattr(track, "has_midi_input", False)) and not bool(getattr(track, "has_audio_input", False)):
+                raise Exception("Track {0} '{1}' is a MIDI track; only audio "
+                                "tracks hold audio clips".format(track_index, track.name))
+            slots = track.clip_slots
+            if clip_index < 0 or clip_index >= len(slots):
+                raise Exception("clip_index {0} out of range (0..{1})".format(
+                    clip_index, len(slots) - 1))
+            slot = slots[clip_index]
+            if slot.has_clip:
+                raise Exception("Clip slot {0} on track {1} already has a clip — "
+                                "delete it first or pick an empty slot".format(
+                                    clip_index, track_index))
+            if not hasattr(slot, "create_audio_clip"):
+                avail = [m for m in dir(slot)
+                         if ("clip" in m.lower() or "audio" in m.lower())
+                         and not m.startswith("__")]
+                raise Exception("ClipSlot.create_audio_clip is not available on "
+                                "this Live build. ClipSlot members of interest: "
+                                "{0}".format(avail))
+            slot.create_audio_clip(fp)
+            clip = slot.clip
+            result = {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "file_path": fp,
+                "created": clip is not None,
+            }
+            if clip is not None:
+                result["name"] = clip.name
+                for k, attr in (("length", "length"), ("is_audio_clip", "is_audio_clip")):
+                    try:
+                        result[k] = getattr(clip, attr)
+                    except Exception:
+                        pass
+            return result
+        except Exception as e:
+            self.log_message("Error creating audio clip in slot: " + str(e))
+            raise
+
     def _add_notes_to_clip(self, track_index, clip_index, notes):
         """REPLACE the MIDI notes in a clip with the given list.
 

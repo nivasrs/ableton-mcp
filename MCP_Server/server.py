@@ -103,7 +103,7 @@ class AbletonConnection:
         # Check if this is a state-modifying command
         is_modifying_command = command_type in [
             "create_midi_track", "create_audio_track", "set_track_name",
-            "create_clip", "add_notes_to_clip", "set_clip_name",
+            "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
             "start_playback", "stop_playback", "load_instrument_or_effect",
             "set_mixer_value", "set_arrangement_loop", "clear_clip_envelope",
@@ -400,6 +400,41 @@ def create_clip(ctx: Context, track_index: int, clip_index: int, length: float =
     except Exception as e:
         logger.error(f"Error creating clip: {str(e)}")
         return f"Error creating clip: {str(e)}"
+
+
+@mcp.tool()
+def create_audio_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    file_path: str,
+) -> str:
+    """
+    Import an audio FILE into a SESSION clip slot (the launcher grid).
+
+    Drops a .wav/.aif/.flac/etc. straight into a clip slot via
+    ClipSlot.create_audio_clip — no manual drag-drop. Use it to place a
+    sample, field recording, rendered stem, or one-shot into Live.
+
+    Parameters:
+    - track_index: an AUDIO track (MIDI tracks can't hold audio clips)
+    - clip_index: an EMPTY clip slot index
+    - file_path: ABSOLUTE path to the audio file (must exist on disk)
+
+    Note: this is the SESSION-view importer. For the arrangement timeline use
+    create_arrangement_clip_from_session; for a MIDI clip use create_clip.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_audio_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "file_path": file_path,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error creating audio clip: {str(e)}")
+        return f"Error creating audio clip: {str(e)}"
 
 @mcp.tool()
 def add_notes_to_clip(
