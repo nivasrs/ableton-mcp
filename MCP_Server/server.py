@@ -2279,10 +2279,11 @@ def set_groove_params(
     Tune a groove's parameters in the groove pool.
 
     Parameters (all 0.0..1.0 unless noted; pass only what you want to change):
-    - amount: overall strength of the groove
-    - timing: timing strength (microtiming shift)
+    - amount: GLOBAL groove-pool strength fader (Song.groove_amount, 0.0..~1.31
+      i.e. 0..131%) — applies to ALL grooves, not just this one
+    - timing: timing strength / microtiming shift (maps to Live's timing_amount)
     - quantization_amount: how strongly the groove pulls notes to grid
-    - random: amount of timing randomization
+    - random: amount of timing randomization (maps to Live's random_amount)
     - velocity_amount: how much the groove shapes velocities
 
     Use get_grooves first to find groove_index.
@@ -2724,9 +2725,10 @@ def snap_clip_to_scale(
     ctx: Context,
     track_index: int,
     clip_index: int,
-    root_note: int,
-    scale_name: str = "Minor",
+    root_note: int = None,
+    scale_name: str = None,
     strategy: str = "nearest",
+    location: str = "session",
 ) -> str:
     """
     Pitch-snap every note in a MIDI clip to the target scale.
@@ -2736,20 +2738,31 @@ def snap_clip_to_scale(
             Pentatonic Major / Pentatonic Minor / Blues / Chromatic.
 
     Parameters:
-    - track_index, clip_index: target MIDI clip (session view)
-    - root_note: 0 (C) .. 11 (B) — same convention as Live's Song.root_note
-    - scale_name: see list above
+    - track_index, clip_index: target MIDI clip
+    - root_note: 0 (C) .. 11 (B), same convention as Live's Song.root_note.
+      OMIT (None) to use the song's CURRENTLY ACTIVE scale root.
+    - scale_name: see list above. OMIT (None) to use the song's active scale
+      (read from Song.scale_intervals) — so you can snap to whatever scale Live
+      is set to without restating it.
     - strategy: 'nearest' (default, ties up) | 'up' | 'down'
+    - location: 'session' (default) | 'arrangement'
+
+    Per-note humanization (probability / velocity deviation / release velocity)
+    is preserved across the snap.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("snap_clip_to_scale", {
+        payload = {
             "track_index": track_index,
             "clip_index": clip_index,
-            "root_note": int(root_note),
-            "scale_name": scale_name,
             "strategy": strategy,
-        })
+            "location": location,
+        }
+        if root_note is not None:
+            payload["root_note"] = int(root_note)
+        if scale_name is not None:
+            payload["scale_name"] = scale_name
+        result = ableton.send_command("snap_clip_to_scale", payload)
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error snapping clip to scale: {e}")

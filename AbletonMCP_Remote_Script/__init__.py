@@ -666,8 +666,9 @@ class AbletonMCP(ControlSurface):
                             groove_index = params.get("groove_index", 0)
                             fields = {
                                 k: params.get(k) for k in
-                                ("amount", "timing", "quantization_amount",
-                                 "random", "velocity_amount", "base")
+                                ("amount", "timing", "timing_amount",
+                                 "quantization_amount", "random", "random_amount",
+                                 "velocity_amount", "base")
                                 if k in params
                             }
                             result = self._set_groove_params(groove_index, **fields)
@@ -843,9 +844,10 @@ class AbletonMCP(ControlSurface):
                             result = self._snap_clip_to_scale(
                                 params.get("track_index", 0),
                                 params.get("clip_index", 0),
-                                params.get("root_note", 0),
-                                params.get("scale_name", "Major"),
-                                params.get("strategy", "nearest"))
+                                params.get("root_note"),
+                                params.get("scale_name"),
+                                params.get("strategy", "nearest"),
+                                params.get("location", "session"))
                         elif command_type == "shape_clip_velocities":
                             result = self._shape_clip_velocities(
                                 params.get("track_index", 0),
@@ -2282,9 +2284,25 @@ class AbletonMCP(ControlSurface):
         "Chromatic":        list(range(12)),
     }
 
-    def _snap_clip_to_scale(self, track_index, clip_index, root_note,
-                              scale_name, strategy="nearest"):
+    def _snap_clip_to_scale(self, track_index, clip_index, root_note=None,
+                              scale_name=None, strategy="nearest",
+                              location="session"):
         """Pitch-snap each note in a clip to the target scale.
+
+        Scale source:
+          - If BOTH root_note and scale_name are None/omitted, default to
+            Live's active global scale: Song.root_note + Song.scale_intervals
+            (both exposed on Live.Song.Song — LomTypes.py:673-674;
+            scale_intervals is a tuple of semitone offsets from root).
+          - If scale_name is given, look it up in the _SCALE_INTERVALS
+            fallback table (root_note defaults to Song.root_note when omitted).
+
+        Humanization-safe: notes are read via the new note API
+        (get_notes_extended) and written back via apply_note_modifications,
+        mutating ONLY pitch on the live MidiNote vector. probability,
+        velocity_deviation and release_velocity are preserved. Falls back to
+        the lossy get_notes/set_notes round-trip only if the Live build lacks
+        the new note API.
 
         Strategy:
           - "nearest": move to nearest scale tone (ties go up)
@@ -2292,23 +2310,42 @@ class AbletonMCP(ControlSurface):
           - "up":      move to nearest scale tone at or above current pitch
         """
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-            if clip_index < 0 or clip_index >= len(track.clip_slots):
-                raise IndexError("Clip index out of range")
-            slot = track.clip_slots[clip_index]
-            if not slot.has_clip:
-                raise Exception("Clip slot is empty")
-            clip = slot.clip
-            if not clip.is_midi_clip:
+            track, clip = self._resolve_clip(track_index, clip_index, location)
+            if not bool(getattr(clip, "is_midi_clip", False)):
                 raise Exception("Source clip is not MIDI")
-            if scale_name not in self._SCALE_INTERVALS:
-                raise ValueError(
-                    "Unknown scale '{0}'. Known: {1}".format(
-                        scale_name, list(self._SCALE_INTERVALS.keys())))
-            root = int(root_note) % 12
-            intervals = self._SCALE_INTERVALS[scale_name]
+
+            song = self._song
+            # Resolve the target scale's pitch classes.
+            if scale_name is None and root_note is None:
+                # Default to Live's active global scale.
+                root_raw = self._safe_get(song, "root_note", int)
+                ivs_raw = self._safe_get(song, "scale_intervals")
+                if isinstance(root_raw, dict) or isinstance(ivs_raw, dict):
+                    raise RuntimeError(
+                        "Song.root_note/scale_intervals not available — "
+                        "Live 12 required, or pass root_note + scale_name "
+                        "explicitly")
+                root = int(root_raw) % 12
+                intervals = list(ivs_raw)
+                if not intervals:
+                    raise RuntimeError("Song.scale_intervals is empty")
+                scale_label = str(self._safe_get(song, "scale_name", str))
+                scale_source = "song"
+            else:
+                # Explicit scale_name path uses the fallback dict; root_note
+                # defaults to the song's current root if omitted.
+                sn = scale_name if scale_name is not None else "Major"
+                if sn not in self._SCALE_INTERVALS:
+                    raise ValueError(
+                        "Unknown scale '{0}'. Known: {1}".format(
+                            sn, list(self._SCALE_INTERVALS.keys())))
+                if root_note is None:
+                    root = int(self._safe_get(song, "root_note", int) or 0) % 12
+                else:
+                    root = int(root_note) % 12
+                intervals = self._SCALE_INTERVALS[sn]
+                scale_label = sn
+                scale_source = "explicit"
             scale_pcs = set((root + iv) % 12 for iv in intervals)
 
             def snap_pitch(p):
@@ -2325,24 +2362,58 @@ class AbletonMCP(ControlSurface):
                 down = next((d for d in range(1, 12) if (p - d) % 12 in scale_pcs), 12)
                 return p + up if up <= down else p - down
 
-            notes = clip.get_notes(0, 0, clip.length, 128)
-            new_notes = []
-            changed = 0
-            for n in notes:
-                # (pitch, time, length, velocity, mute)
-                pitch, t, length, vel, mute = n
-                new_pitch = snap_pitch(int(pitch))
-                if new_pitch != pitch:
-                    changed += 1
-                new_notes.append((new_pitch, t, length, vel, mute))
-            clip.set_notes(tuple(new_notes))
+            # Humanization-preserving path: mutate pitch in place on the live
+            # MidiNote vector via the new note API. Mirrors
+            # _apply_note_modifications (~5837): get_notes_*  ->  setattr  ->
+            # apply_note_modifications, which keeps probability /
+            # velocity_deviation / release_velocity intact.
+            use_new = (hasattr(clip, "get_notes_extended")
+                       and hasattr(clip, "apply_note_modifications"))
+            if use_new:
+                length = max(float(getattr(clip, "length", 0.0) or 0.0), 1.0)
+                # Live 12.3.7 signature is INTS-FIRST:
+                # (from_pitch, pitch_span, from_time, time_span) — verified
+                # 2026-06-01, same pattern as remove_notes_extended (line 5668)
+                # and get_notes_extended (line 5789).
+                vec = clip.get_notes_extended(0, 128, 0.0, length)
+                changed = 0
+                count = 0
+                for note in vec:
+                    count += 1
+                    p = int(getattr(note, "pitch"))
+                    np = snap_pitch(p)
+                    if np != p:
+                        setattr(note, "pitch", int(np))
+                        changed += 1
+                clip.apply_note_modifications(vec)
+                api = "new"
+            else:
+                # Lossy fallback (drops per-note humanization) only when the
+                # build lacks the new note API.
+                notes = clip.get_notes(0, 0, clip.length, 128)
+                new_notes = []
+                changed = 0
+                for n in notes:
+                    # (pitch, time, length, velocity, mute)
+                    pitch, t, nlen, vel, mute = n
+                    new_pitch = snap_pitch(int(pitch))
+                    if new_pitch != pitch:
+                        changed += 1
+                    new_notes.append((new_pitch, t, nlen, vel, mute))
+                clip.set_notes(tuple(new_notes))
+                count = len(notes)
+                api = "old"
+
             return {
                 "track_index": track_index,
                 "clip_index": clip_index,
-                "scale": scale_name,
+                "location": str(location).lower(),
+                "scale": scale_label,
+                "scale_source": scale_source,
                 "root_note": root,
                 "strategy": strategy,
-                "note_count": len(notes),
+                "api": api,
+                "note_count": count,
                 "notes_changed": changed,
             }
         except Exception as e:
@@ -2397,22 +2468,60 @@ class AbletonMCP(ControlSurface):
                     return lo + spread * 0.5
                 raise ValueError("Unknown curve '{0}'".format(curve))
 
-            notes = clip.get_notes(0, 0, length, 128)
-            new_notes = []
-            for n in notes:
-                pitch, t, dur, vel, mute = n
-                frac = float(t) / length if length > 0 else 0.0
-                new_vel = int(round(value_at(frac)))
-                new_vel = max(1, min(127, new_vel))
-                new_notes.append((pitch, t, dur, new_vel, mute))
-            clip.set_notes(tuple(new_notes))
+            # Preferred path: read via the new note API so we keep each
+            # note's note_id + per-note humanization (probability,
+            # velocity_deviation, release_velocity). We then mutate ONLY
+            # velocity in the dicts and hand them to _apply_note_modifications,
+            # which re-fetches the live MidiNote vector via get_notes_by_id and
+            # setattrs only the fields present per dict — so the non-velocity
+            # humanization fields are never touched and survive intact.
+            ext = self._get_notes_extended(
+                track_index, clip_index,
+                from_time=0.0, time_span=length,
+                from_pitch=0, pitch_span=128,
+                location="session")
+            ext_notes = ext.get("notes", [])
+            api = ext.get("api")
+            if api == "new":
+                mods = []
+                for d in ext_notes:
+                    nid = d.get("note_id")
+                    if nid is None:
+                        continue
+                    t = float(d.get("start_time", 0.0))
+                    frac = t / length if length > 0 else 0.0
+                    new_vel = int(round(value_at(frac)))
+                    new_vel = max(1, min(127, new_vel))
+                    mods.append({"note_id": nid, "velocity": new_vel})
+                if mods:
+                    self._apply_note_modifications(
+                        track_index, clip_index, mods, location="session")
+                note_count = len(ext_notes)
+                preserved = True
+            else:
+                # Old-API Live build: get_notes_extended/apply_note_modifications
+                # are unavailable, so there are no per-note humanization fields
+                # to preserve. Fall back to the legacy round-trip.
+                notes = clip.get_notes(0, 0, length, 128)
+                new_notes = []
+                for n in notes:
+                    pitch, t, dur, vel, mute = n
+                    frac = float(t) / length if length > 0 else 0.0
+                    new_vel = int(round(value_at(frac)))
+                    new_vel = max(1, min(127, new_vel))
+                    new_notes.append((pitch, t, dur, new_vel, mute))
+                clip.set_notes(tuple(new_notes))
+                note_count = len(notes)
+                preserved = False
             return {
                 "track_index": track_index,
                 "clip_index": clip_index,
                 "curve": curve,
                 "min_velocity": lo,
                 "max_velocity": hi,
-                "note_count": len(notes),
+                "note_count": note_count,
+                "api": api,
+                "humanization_preserved": preserved,
             }
         except Exception as e:
             self.log_message("Error shaping velocities: " + str(e))
@@ -2487,18 +2596,24 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _jump_to_beat(self, beat):
-        """Set current_song_time to an absolute beat position.
+        """Set the song playhead to an absolute beat position.
 
-        Don't read current_song_time back — it's stale within the same main-thread
-        tick (the setter is committed on the next tick but this handler runs
-        synchronously inside schedule_message's callback).
+        Delegates to _seek_to, which applies Live's canonical "write-both"
+        pattern (current_song_time + start_time when stopped) from
+        ableton/v2/base/live_api_utils.py:34-36. Writing only
+        current_song_time silently fails while the transport is STOPPED, so
+        the bare-setter version of this handler never moved the playhead at
+        rest. _seek_to echoes the requested value when stopped (readback is
+        one Live-tick stale), so we surface that as the legacy 'beat' key
+        the callers still read (MCP_Server/server.py:1060).
         """
         try:
             b = float(beat)
             if b < 0:
                 raise ValueError("beat must be >= 0")
-            self._song.current_song_time = b
-            return {"beat": b}
+            res = self._seek_to(b)
+            res["beat"] = res.get("current_song_time", b)
+            return res
         except Exception as e:
             self.log_message("Error jumping to beat: " + str(e))
             raise
@@ -3964,15 +4079,28 @@ class AbletonMCP(ControlSurface):
                         "{0}, not requested {1}. Scrub Live's UI cursor "
                         "first to position the playhead.").format(
                         actual_cst, requested_time)
-            before_ids = {id(c) for c in song.cue_points}
+            # Snapshot by VALUE not id() — Live returns FRESH Python wrappers
+            # each access so id() diffing can miss the new cue (same fresh-
+            # wrapper trap fixed in _duplicate_arrangement_clip). Key cues on
+            # (round(time,6), name); CuePoint.time/name are exposed (LomTypes
+            # ~712-716). Use list (not set) so duplicate-keyed cues diff right.
+            def _cue_key(c):
+                return (round(float(getattr(c, "time", 0.0)), 6),
+                        getattr(c, "name", "") or "")
+            before_keys = [_cue_key(c) for c in song.cue_points]
+            before_count = len(before_keys)
             song.set_or_delete_cue()
             after = list(song.cue_points)
             created = None
+            remaining_before = list(before_keys)
             for c in after:
-                if id(c) not in before_ids:
+                k = _cue_key(c)
+                if k in remaining_before:
+                    remaining_before.remove(k)
+                else:
                     created = c
                     break
-            deleted = len(after) < len(before_ids)
+            deleted = len(after) < before_count
             if created is not None and name is not None:
                 created.name = str(name)
             result = {
@@ -4052,8 +4180,17 @@ class AbletonMCP(ControlSurface):
     #  - getattr raises (silently swallowed before patch)
     #  - properties exposed as DeviceParameters not Python attrs
     # Patched 2026-05-17 to log errors AND surface what's available.
-    _GROOVE_FIELDS = ("timing", "quantization_amount",
-                      "random", "velocity_amount", "base")
+    # Canonical LOM attr names on Live.Groove.Groove (LomTypes.py L323-330):
+    # base, quantization_amount, random_amount, timing_amount, velocity_amount.
+    # The pre-2026-06-13 code used 'timing'/'random' (wrong) so hasattr()
+    # silently skipped those two knobs. We now store the real names and accept
+    # the old wire aliases for back-compat.
+    _GROOVE_FIELDS = ("timing_amount", "quantization_amount",
+                      "random_amount", "velocity_amount", "base")
+
+    # Old wire param -> real Live.Groove.Groove attribute.
+    _GROOVE_FIELD_ALIASES = {"timing": "timing_amount",
+                             "random": "random_amount"}
 
     def _summarize_groove(self, groove, index=None):
         out = {"index": index, "name": getattr(groove, "name", "")}
@@ -4102,8 +4239,17 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _set_groove_params(self, groove_index, **fields):
-        """Set fields on a groove. Valid fields: amount, timing,
-        quantization_amount, random, velocity_amount, base."""
+        """Set fields on a groove and/or the global groove amount.
+
+        Per-groove fields (real Live.Groove.Groove attrs): timing_amount,
+        quantization_amount, random_amount, velocity_amount, base. The old
+        wire aliases 'timing' and 'random' are accepted and mapped to
+        timing_amount / random_amount for back-compat.
+
+        Special field `amount` is NOT a per-groove property: it routes to
+        Song.groove_amount (the global groove-strength fader, ~0.0..1.31 /
+        0..131%). Live clamps out-of-range values internally.
+        """
         try:
             pool = self._song.groove_pool
             grooves = list(pool.grooves)
@@ -4114,17 +4260,25 @@ class AbletonMCP(ControlSurface):
             for f, v in fields.items():
                 if v is None:
                     continue
-                if f not in self._GROOVE_FIELDS:
-                    raise ValueError("Unknown groove field '{0}'. Valid: {1}".format(
-                        f, ", ".join(self._GROOVE_FIELDS)))
-                if not hasattr(g, f):
+                # Global groove amount lives on the Song, not the Groove.
+                if f == "amount":
+                    self._song.groove_amount = float(v)
+                    changed["amount"] = self._song.groove_amount
                     continue
-                setattr(g, f, float(v) if f != "base" else v)
-                changed[f] = getattr(g, f)
+                # Map deprecated wire aliases to canonical LOM attr names.
+                real = self._GROOVE_FIELD_ALIASES.get(f, f)
+                if real not in self._GROOVE_FIELDS:
+                    raise ValueError("Unknown groove field '{0}'. Valid: amount, {1}".format(
+                        f, ", ".join(self._GROOVE_FIELDS)))
+                if not hasattr(g, real):
+                    continue
+                setattr(g, real, float(v) if real != "base" else v)
+                changed[real] = getattr(g, real)
             return {
                 "groove_index": groove_index,
                 "name": g.name,
                 "changed": changed,
+                "global_groove_amount": getattr(self._song, "groove_amount", None),
                 "groove": self._summarize_groove(g, groove_index),
             }
         except Exception as e:
