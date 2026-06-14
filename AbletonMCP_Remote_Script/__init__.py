@@ -320,13 +320,16 @@ class AbletonMCP(ControlSurface):
                     params.get("track_index", 0))
             elif command_type == "get_exclusive_mode":
                 response["result"] = self._get_exclusive_mode()
+            elif command_type == "get_track_meter":
+                response["result"] = self._get_track_meter(
+                    params.get("track_index", 0))
             # These commands must run on the main thread (writes + note reads)
             elif command_type in ["get_clip_notes",
                                  "create_midi_track", "set_track_name",
                                  "create_clip", "create_audio_clip",
                                  "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
-                                 "start_playback", "stop_playback", "load_browser_item",
+                                 "start_playback", "continue_playback", "stop_playback", "load_browser_item",
                                  "set_device_parameter", "set_mixer_value",
                                  "set_arrangement_loop", "clear_clip_envelope",
                                  # Tier 1
@@ -409,7 +412,8 @@ class AbletonMCP(ControlSurface):
                                  "set_track_activator",
                                  "set_clip_markers",
                                  "set_session_automation_record",
-                                 "set_exclusive_mode"]:
+                                 "set_exclusive_mode",
+                                 "play_selection"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -461,6 +465,8 @@ class AbletonMCP(ControlSurface):
                             result = self._stop_clip(track_index, clip_index)
                         elif command_type == "start_playback":
                             result = self._start_playback()
+                        elif command_type == "continue_playback":
+                            result = self._continue_playback()
                         elif command_type == "stop_playback":
                             result = self._stop_playback()
                         elif command_type == "load_instrument_or_effect":
@@ -954,6 +960,8 @@ class AbletonMCP(ControlSurface):
                             result = self._set_exclusive_mode(
                                 params.get("exclusive_arm"),
                                 params.get("exclusive_solo"))
+                        elif command_type == "play_selection":
+                            result = self._play_selection()
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1068,6 +1076,61 @@ class AbletonMCP(ControlSurface):
                     "type": self._get_device_type(device)
                 })
             
+            # --- Enrichments (each read raise-guarded per LOM getter lesson) ---
+            # color / color_index
+            try:
+                color = track.color
+            except Exception:
+                color = None
+            try:
+                color_index = track.color_index
+            except Exception:
+                color_index = None
+
+            # is_frozen
+            try:
+                is_frozen = bool(track.is_frozen)
+            except Exception:
+                is_frozen = None
+
+            # fold_state: ONLY meaningful on foldable (group) tracks; raises/garbage otherwise
+            try:
+                is_foldable = bool(track.is_foldable)
+            except Exception:
+                is_foldable = False
+            if is_foldable:
+                try:
+                    fold_state = bool(track.fold_state)
+                except Exception:
+                    fold_state = None
+            else:
+                fold_state = None
+
+            # current_monitoring_state: int enum (0=IN, 1=AUTO, 2=OFF); None on tracks
+            # that can't be monitored (e.g. group tracks) where getter may raise
+            try:
+                current_monitoring_state = track.current_monitoring_state
+            except Exception:
+                current_monitoring_state = None
+
+            # muted_via_solo
+            try:
+                muted_via_solo = bool(track.muted_via_solo)
+            except Exception:
+                muted_via_solo = None
+
+            # group_track -> resolve parent group Track object to its index in song.tracks
+            group_track_index = None
+            try:
+                parent = track.group_track  # None when not grouped
+                if parent is not None:
+                    for i, t in enumerate(self._song.tracks):
+                        if id(t) == id(parent):
+                            group_track_index = i
+                            break
+            except Exception:
+                group_track_index = None
+
             result = {
                 "index": track_index,
                 "name": track.name,
@@ -1078,6 +1141,13 @@ class AbletonMCP(ControlSurface):
                 "arm": track.arm if getattr(track, "can_be_armed", False) else False,
                 "volume": track.mixer_device.volume.value,
                 "panning": track.mixer_device.panning.value,
+                "color": color,
+                "color_index": color_index,
+                "is_frozen": is_frozen,
+                "fold_state": fold_state,
+                "current_monitoring_state": current_monitoring_state,
+                "muted_via_solo": muted_via_solo,
+                "group_track_index": group_track_index,
                 "clip_slots": clip_slots,
                 "devices": devices
             }
@@ -2819,7 +2889,22 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error starting playback: " + str(e))
             raise
-    
+
+    def _continue_playback(self):
+        """Resume playing from the current playhead position.
+
+        Wraps Song.continue_playing() which, unlike start_playing()
+        (restarts from the cursor/loop start), continues from wherever the
+        transport last left off — pairs with seek_to/seek_by to play from
+        an arbitrary beat.
+        """
+        try:
+            self._song.continue_playing()
+            return {"playing": self._song.is_playing}
+        except Exception as e:
+            self.log_message("Error continuing playback: " + str(e))
+            raise
+
     def _stop_playback(self):
         """Stop playing the session"""
         try:
@@ -3899,6 +3984,22 @@ class AbletonMCP(ControlSurface):
                         if c == target:
                             chain_idx = i
                             break
+                # out_note / choke_group live on the pad's DrumChain (LomTypes
+                # L414: Live.DrumChain.DrumChain exposes out_note + choke_group).
+                # MFLProperty getters can RAISE rather than be absent, so guard
+                # each read with try/except (NOT getattr-with-default).
+                out_note = None
+                choke_group = None
+                if pad_chains:
+                    drum_chain = pad_chains[0]
+                    try:
+                        out_note = int(drum_chain.out_note)
+                    except Exception:
+                        out_note = None
+                    try:
+                        choke_group = int(drum_chain.choke_group)
+                    except Exception:
+                        choke_group = None
                 pad_dicts.append({
                     "note": int(pad.note),
                     "name": pad.name or "",
@@ -3906,6 +4007,8 @@ class AbletonMCP(ControlSurface):
                     "solo": bool(pad.solo),
                     "chain_count": len(pad_chains),
                     "chain_index": chain_idx,
+                    "out_note": out_note,
+                    "choke_group": choke_group,
                     "devices": [
                         {"index": i, "name": d.name, "class_name": d.class_name}
                         for i, d in enumerate(pad_chains[0].devices)
@@ -4038,12 +4141,22 @@ class AbletonMCP(ControlSurface):
             in_key_raw = getattr(song, "in_key", None)
             if scale_name is None and root_note is None:
                 raise RuntimeError("Song.scale_name/root_note not available — Live 12 required")
+            # scale_intervals (Song.scale_intervals — tuple of semitone offsets
+            # from root). RAISE-GUARDED per LomTypes lesson: some exposed getters
+            # raise rather than being absent on certain Live builds, and the value
+            # is a tuple (not JSON-serializable) so coerce to list.
+            try:
+                raw_intervals = getattr(song, "scale_intervals", None)
+                scale_intervals = list(raw_intervals) if raw_intervals is not None else None
+            except Exception:
+                scale_intervals = None
             return {
                 "scale_name": scale_name,
                 "root_note": root_note,
                 "root_name": self._NOTE_NAMES[int(root_note) % 12] if root_note is not None else None,
                 "in_key": bool(in_key_raw) if in_key_raw is not None else None,
                 "in_key_raw": in_key_raw,  # None means UI never toggled it; not an error
+                "scale_intervals": scale_intervals,  # semitone offsets from root, e.g. Major=[0,2,4,5,7,9,11]
             }
         except Exception as e:
             self.log_message("Error reading song scale: " + str(e))
@@ -4606,6 +4719,22 @@ class AbletonMCP(ControlSurface):
                     sel["selected_chain"] = {"name": ch.name}
             except Exception:
                 pass
+            try:
+                t2 = view.selected_track
+                if t2 is not None:
+                    # Track.View.selected_device (LomTypes L814). Works on
+                    # any track kind (audio/MIDI/return/master all expose
+                    # .devices, L751). None when nothing/no devices selected.
+                    dev = t2.view.selected_device
+                    if dev is not None:
+                        dsel = {"name": dev.name}
+                        try:
+                            dsel["index"] = list(t2.devices).index(dev)
+                        except (ValueError, Exception):
+                            dsel["index"] = -1
+                        sel["selected_device"] = dsel
+            except Exception:
+                pass
             return sel
         except Exception as e:
             self.log_message("Error reading selection: " + str(e))
@@ -4836,11 +4965,47 @@ class AbletonMCP(ControlSurface):
                 out["follow_action_a_name"] = self._FOLLOW_ACTIONS.get(out["follow_action_a"])
             if "follow_action_b" in out:
                 out["follow_action_b_name"] = self._FOLLOW_ACTIONS.get(out["follow_action_b"])
+            # Loop / marker region (all clip types)
+            for attr in ("loop_start", "loop_end", "start_marker", "end_marker"):
+                if hasattr(clip, attr):
+                    try:
+                        out[attr] = float(getattr(clip, attr))
+                    except Exception:
+                        out[attr] = None
+            # Time signature (all clip types)
+            for attr in ("signature_numerator", "signature_denominator"):
+                if hasattr(clip, attr):
+                    try:
+                        out[attr] = int(getattr(clip, attr))
+                    except Exception:
+                        out[attr] = None
+            # Groove (Clip.groove is a Groove object or None; surface its name)
+            if hasattr(clip, "groove"):
+                try:
+                    g = clip.groove
+                    out["groove"] = g.name if g is not None else None
+                except Exception:
+                    out["groove"] = None
             # Audio-clip extras
             if is_audio:
                 for attr in ("gain", "pitch_coarse", "pitch_fine"):
                     if hasattr(clip, attr):
                         out[attr] = float(getattr(clip, attr))
+                # warping / warp_mode: audio-only; warp_mode getter raises on
+                # MIDI clips, so guard each read individually.
+                if hasattr(clip, "warping"):
+                    try:
+                        out["warping"] = bool(clip.warping)
+                    except Exception:
+                        out["warping"] = None
+                if hasattr(clip, "warp_mode"):
+                    try:
+                        wm = int(clip.warp_mode)
+                        out["warp_mode"] = wm
+                        out["warp_mode_name"] = self._warp_mode_name(wm)
+                    except Exception:
+                        out["warp_mode"] = None
+                        out["warp_mode_name"] = None
             return out
         except Exception as e:
             self.log_message("Error reading clip settings: " + str(e))
@@ -4932,52 +5097,103 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting clip launch settings: " + str(e))
             raise
 
+    # follow-action attribute-name candidates, in (lowercase, Ziforge-fork
+    # capital-suffix) pairs. EXPOSED_TYPE_PROPERTIES on Live 12.3.7 lists
+    # neither (LomTypes.py L231-312), so the live pybind object is the only
+    # source of truth — probe both names at runtime.
+    _FA_ATTR_CANDIDATES = {
+        "enabled":  ("follow_action_enabled",),
+        "action_a": ("follow_action_a", "follow_action_A"),
+        "action_b": ("follow_action_b", "follow_action_B"),
+        "chance_a": ("follow_action_chance_a", "chance_A", "follow_action_chance_A"),
+        "chance_b": ("follow_action_chance_b", "chance_B", "follow_action_chance_B"),
+        "time":     ("follow_action_time",),
+    }
+
+    def _fa_resolve_attr(self, clip, field):
+        """Return the first follow-action attr name that EXISTS on this clip
+        for the logical field, else None. hasattr-only probe (no read) —
+        safe because presence-check does not trigger getter-raise."""
+        for name in self._FA_ATTR_CANDIDATES.get(field, ()):
+            if hasattr(clip, name):
+                return name
+        return None
+
     def _set_clip_follow_action(self, track_index, clip_index,
                                   enabled=None, action_a=None, action_b=None,
                                   chance_a=None, chance_b=None, time_beats=None):
         """Set follow action on a clip.
 
-        LIVE API LIMITATION (Live 12.3.7, verified 2026-05-17): follow
-        action properties are NOT exposed on Clip in the LOM. Grep of
-        the entire AbletonLive12_MIDIRemoteScripts directory returns zero
-        references to `follow_action`. Despite being a Live 11+
-        user-facing feature, the LOM doesn't surface it. Tool raises
-        NotImplementedError with guidance.
+        Live 12.3.7: follow_action_* is NOT in EXPOSED_TYPE_PROPERTIES
+        (LomTypes.py L231-312) and zero Remote Script files reference it.
+        BUT the raw Live.Clip.Clip pybind object may still carry the attrs
+        under either the lowercase names or the Ziforge-fork capital-suffix
+        names (follow_action_A / chance_A). We probe both at runtime; if
+        NEITHER exists we keep raising NotImplementedError.
+        Per LESSON 1: every read of a newly-surfaced property is wrapped in
+        try/except (some pybind getters RAISE rather than being absent).
         """
         try:
             clip = self._get_clip_at(track_index, clip_index)
-            if not hasattr(clip, "follow_action_enabled"):
+            # presence gate: any follow-action attr under either convention
+            present = {f: self._fa_resolve_attr(clip, f)
+                       for f in ("enabled", "action_a", "action_b",
+                                 "chance_a", "chance_b", "time")}
+            if not any(present.values()):
                 raise NotImplementedError(
-                    "Clip.follow_action_* not exposed on Live 12.3.7 LOM "
-                    "(verified — no Remote Script references the API). "
-                    "Configure follow actions manually in Live's clip view.")
+                    "Clip.follow_action_* not exposed on this Live build "
+                    "(probed lowercase + Ziforge capital-suffix names; none "
+                    "present). Configure follow actions manually in clip view.")
             changed = {}
-            if enabled is not None:
-                clip.follow_action_enabled = bool(enabled)
-                changed["follow_action_enabled"] = bool(clip.follow_action_enabled)
-            if action_a is not None:
+
+            def _readback(attr, cast):
+                """Guarded read-back; some pybind getters raise."""
+                try:
+                    return cast(getattr(clip, attr))
+                except Exception as re:
+                    self.log_message(
+                        "follow-action readback of {0} raised: {1}".format(attr, re))
+                    return None
+
+            if enabled is not None and present["enabled"]:
+                a = present["enabled"]
+                setattr(clip, a, bool(enabled))
+                changed["follow_action_enabled"] = _readback(a, bool)
+            if action_a is not None and present["action_a"]:
+                a = present["action_a"]
                 v = self._resolve_follow_action(action_a)
-                clip.follow_action_a = v
-                changed["follow_action_a"] = int(clip.follow_action_a)
-                changed["follow_action_a_name"] = self._FOLLOW_ACTIONS.get(int(clip.follow_action_a))
-            if action_b is not None:
+                setattr(clip, a, v)
+                rb = _readback(a, int)
+                changed["follow_action_a"] = rb
+                changed["follow_action_a_name"] = self._FOLLOW_ACTIONS.get(rb)
+            if action_b is not None and present["action_b"]:
+                a = present["action_b"]
                 v = self._resolve_follow_action(action_b)
-                clip.follow_action_b = v
-                changed["follow_action_b"] = int(clip.follow_action_b)
-                changed["follow_action_b_name"] = self._FOLLOW_ACTIONS.get(int(clip.follow_action_b))
-            if chance_a is not None:
-                clip.follow_action_chance_a = max(0, min(127, int(chance_a)))
-                changed["follow_action_chance_a"] = int(clip.follow_action_chance_a)
-            if chance_b is not None:
-                clip.follow_action_chance_b = max(0, min(127, int(chance_b)))
-                changed["follow_action_chance_b"] = int(clip.follow_action_chance_b)
-            if time_beats is not None:
-                clip.follow_action_time = max(0.0, float(time_beats))
-                changed["follow_action_time"] = float(clip.follow_action_time)
+                setattr(clip, a, v)
+                rb = _readback(a, int)
+                changed["follow_action_b"] = rb
+                changed["follow_action_b_name"] = self._FOLLOW_ACTIONS.get(rb)
+            if chance_a is not None and present["chance_a"]:
+                a = present["chance_a"]
+                setattr(clip, a, max(0, min(127, int(chance_a))))
+                changed["follow_action_chance_a"] = _readback(a, int)
+            if chance_b is not None and present["chance_b"]:
+                a = present["chance_b"]
+                setattr(clip, a, max(0, min(127, int(chance_b))))
+                changed["follow_action_chance_b"] = _readback(a, int)
+            if time_beats is not None and present["time"]:
+                a = present["time"]
+                setattr(clip, a, max(0.0, float(time_beats)))
+                changed["follow_action_time"] = _readback(a, float)
             if not changed:
-                raise ValueError("No follow-action fields provided")
+                # something was requested but its attr was absent under both names
+                raise ValueError(
+                    "No follow-action fields applied. Requested fields not "
+                    "present on this clip. Probed attrs: {0}".format(
+                        {f: present[f] for f in present}))
             return {"track_index": track_index, "clip_index": clip_index,
-                    "name": clip.name, "changed": changed}
+                    "name": clip.name, "changed": changed,
+                    "attr_names_used": {f: n for f, n in present.items() if n}}
         except Exception as e:
             self.log_message("Error setting clip follow action: " + str(e))
             raise
@@ -5029,22 +5245,77 @@ class AbletonMCP(ControlSurface):
     def _set_track_freeze(self, track_index, freeze):
         """Freeze or unfreeze a track.
 
-        LIVE API LIMITATION (Live 12.3.7, verified 2026-05-17):
-        `Track.freeze()` / `Track.unfreeze()` methods are NOT exposed
-        on the LOM. Only the read-only `Track.is_frozen` property exists.
-        Push2 + all Remote Scripts only read this state — freezing must
-        be done via Live's UI (right-click track → Freeze Track).
+        PROBE (2026-06-14): some Ableton Remote-Script forks (e.g. Ziforge)
+        expose a writable `Track.freeze_state` int (1=frozen, 0=unfrozen).
+        Stock Live 12.3.7 does NOT: LomTypes EXPOSED_TYPE_PROPERTIES for
+        Live.Track.Track lists only the read-only `can_be_frozen` and
+        `is_frozen` props (no `freeze_state`, no `freeze()`/`unfreeze()`).
 
-        The Live 11 API docs claim freeze() exists, but it's gated to
-        internal use only. Raises NotImplementedError with guidance.
+        Strategy: try the writable `freeze_state` path if the attribute is
+        present; otherwise raise NotImplementedError with current state and
+        UI guidance. Every newly-surfaced property read is guarded with
+        try/except because MFLProperty getters can RAISE rather than be
+        absent.
         """
         track = self._resolve_track(track_index)
-        is_frozen = bool(getattr(track, "is_frozen", False))
+
+        def _read_is_frozen():
+            try:
+                return bool(track.is_frozen)
+            except Exception:
+                return None
+
+        want = 1 if freeze else 0
+
+        # Probe for the forked writable property. Use try/except around the
+        # READ too: a getter may exist yet raise (lesson: default_value).
+        has_freeze_state = False
+        try:
+            _ = track.freeze_state
+            has_freeze_state = True
+        except AttributeError:
+            has_freeze_state = False
+        except Exception:
+            # Attribute exists but getter raised — still try to write it.
+            has_freeze_state = True
+
+        if has_freeze_state:
+            # Refuse no-op / impossible freezes cleanly.
+            if freeze:
+                try:
+                    if not bool(track.can_be_frozen):
+                        raise NotImplementedError(
+                            "Track '{0}' cannot be frozen (can_be_frozen is "
+                            "False — e.g. group/return/master).".format(track.name))
+                except NotImplementedError:
+                    raise
+                except Exception:
+                    pass  # can_be_frozen getter unavailable; attempt anyway
+            try:
+                track.freeze_state = want
+            except Exception as e:
+                raise NotImplementedError(
+                    ("Track.freeze_state is present but writing {0} failed: "
+                     "{1}. Track '{2}' is_frozen={3}.").format(
+                        want, e, track.name, _read_is_frozen()))
+            after = _read_is_frozen()
+            return {
+                "track_index": track_index,
+                "name": track.name,
+                "requested_freeze": bool(freeze),
+                "is_frozen": after,
+                "via": "freeze_state",
+            }
+
+        # No writable property on this build — clean, honest failure.
+        is_frozen = _read_is_frozen()
         raise NotImplementedError(
-            ("Track.freeze()/unfreeze() not exposed on Live 12.3.7 LOM. "
-             "Track '{0}' currently is_frozen={1}. "
-             "To toggle: right-click the track in Live and choose "
-             "Freeze Track / Unfreeze Track.").format(track.name, is_frozen))
+            ("Track freeze is read-only on this Live build: neither "
+             "Track.freeze_state nor freeze()/unfreeze() is exposed by the "
+             "LOM (only is_frozen/can_be_frozen). Track '{0}' currently "
+             "is_frozen={1}. To toggle: right-click the track in Live and "
+             "choose Freeze Track / Unfreeze Track.").format(
+                track.name, is_frozen))
 
     def _set_track_color(self, track_index, color=None, color_index=None):
         """Set track color via RGB int or Live's color palette index (0..69).
@@ -5147,8 +5418,9 @@ class AbletonMCP(ControlSurface):
             "is_triggered": bool(getattr(scene, "is_triggered", False)),
             "is_empty": bool(getattr(scene, "is_empty", False)),
         }
-        for attr in ("color", "color_index", "tempo",
-                     "time_signature_numerator", "time_signature_denominator"):
+        for attr in ("color", "color_index", "tempo", "tempo_enabled",
+                     "time_signature_numerator", "time_signature_denominator",
+                     "time_signature_enabled"):
             try:
                 if hasattr(scene, attr):
                     out[attr] = getattr(scene, attr)
@@ -5378,6 +5650,16 @@ class AbletonMCP(ControlSurface):
                 "loop_length": self._safe_get(song, "loop_length"),
                 "song_length": self._safe_get(song, "song_length"),
                 "groove_amount": self._safe_get(song, "groove_amount"),
+                # Option-B-3 enrichment (2026-06-14): three more Song-level reads.
+                # last_event_time: arrangement time of the last event (float beats).
+                # is_counting_in: True while metronome count-in is active before record.
+                # re_enable_automation_enabled: True when "Re-Enable Automation" button is lit
+                #   (manual overrides exist that can be re-armed). All confirmed on
+                #   Live.Song.Song in LomTypes.py (L652 / L646 / L669). _safe_get wraps
+                #   each in try/except per the "getters may raise" lesson.
+                "last_event_time": self._safe_get(song, "last_event_time"),
+                "is_counting_in": self._safe_get(song, "is_counting_in", bool),
+                "re_enable_automation_enabled": self._safe_get(song, "re_enable_automation_enabled", bool),
             }
         except Exception as e:
             self.log_message("Error reading transport state: " + str(e))
@@ -6268,6 +6550,60 @@ class AbletonMCP(ControlSurface):
             return self._seek_to(target)
         except Exception as e:
             self.log_message("Error seek_by: " + str(e))
+            raise
+
+    def _play_selection(self):
+        """Audition the current Arrangement time selection (Song.play_selection).
+
+        BEST-EFFORT: play_selection() is a no-op if no time selection exists
+        in the Arrangement view (Live silently does nothing, no exception).
+        We report is_playing so the caller can detect whether playback
+        actually started; the readback is separately guarded.
+        """
+        try:
+            self._song.play_selection()
+        except Exception as e:
+            self.log_message("Error play_selection: " + str(e))
+            raise
+        playing = None
+        try:
+            playing = bool(self._song.is_playing)
+        except Exception:
+            pass
+        return {"ok": True, "playing": playing}
+
+    def _get_track_meter(self, track_index):
+        """Read Track output level meters (0.0..1.0): output_meter_level
+        (primary peak/summed post-fader) + output_meter_left/right.
+
+        These are LIVE engine-driven meters — they read ~0.0 when the
+        transport is stopped or the track is silent (a 0.0 is NOT an error).
+        Each field guarded individually (some builds raise on meter reads for
+        MIDI tracks with no instrument).
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            result = {"track_index": track_index}
+            for field in ("output_meter_level", "output_meter_left",
+                          "output_meter_right"):
+                try:
+                    result[field] = float(getattr(track, field))
+                except Exception as e:
+                    result[field] = None
+                    result[field + "_error"] = str(e)
+            try:
+                result["name"] = track.name
+            except Exception:
+                pass
+            try:
+                result["has_audio_output"] = bool(track.has_audio_output)
+            except Exception:
+                pass
+            return result
+        except Exception as e:
+            self.log_message("Error get_track_meter: " + str(e))
             raise
 
     def _get_track_activator(self, track_index):

@@ -105,7 +105,8 @@ class AbletonConnection:
             "create_midi_track", "create_audio_track", "set_track_name",
             "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "start_playback", "stop_playback", "load_instrument_or_effect",
+            "start_playback", "continue_playback", "play_selection",
+            "stop_playback", "load_instrument_or_effect",
             "set_mixer_value", "set_arrangement_loop", "clear_clip_envelope",
             # Tier 1 writes
             "duplicate_track", "delete_track", "undo", "redo",
@@ -1417,6 +1418,40 @@ def start_playback(ctx: Context) -> str:
     except Exception as e:
         logger.error(f"Error starting playback: {str(e)}")
         return f"Error starting playback: {str(e)}"
+
+@mcp.tool()
+def continue_playback(ctx: Context) -> str:
+    """Resume Ableton playback from the CURRENT playhead position.
+
+    Unlike start_playback (which restarts from the loop/cursor start), this
+    calls Song.continue_playing() to continue from wherever the transport
+    last left off. Pair with seek_to/seek_by to audition from an arbitrary
+    beat (seek there, then continue_playback).
+    """
+    try:
+        ableton = get_ableton_connection()
+        ableton.send_command("continue_playback")
+        return "Continued playback from the current position"
+    except Exception as e:
+        logger.error(f"Error continuing playback: {str(e)}")
+        return f"Error continuing playback: {str(e)}"
+
+@mcp.tool()
+def play_selection(ctx: Context) -> str:
+    """Audition the current Arrangement time selection (Song.play_selection()).
+
+    Plays the region currently selected in Live's Arrangement view — like
+    pressing space over an Arrangement selection. Define the range first via
+    set_selection (or manually in Live). BEST-EFFORT: if no time selection
+    exists, Live silently does nothing; check the returned `playing` flag.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("play_selection")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error play_selection: {str(e)}")
+        return f"Error play_selection: {str(e)}"
 
 @mcp.tool()
 def stop_playback(ctx: Context) -> str:
@@ -4221,6 +4256,32 @@ def get_track_activator(
     except Exception as e:
         logger.error(f"Error get_track_activator: {e}")
         return f"Error get_track_activator: {e}"
+
+
+@mcp.tool()
+def get_track_meter(ctx: Context, track_index: int) -> str:
+    """
+    Read a track's OUTPUT level meters (0.0..1.0).
+
+    Returns Track.output_meter_level (primary peak/summed post-fader level)
+    plus output_meter_left / output_meter_right (per-channel) — LIVE meters
+    fed by the audio engine.
+
+    IMPORTANT — meters are only meaningful DURING PLAYBACK. When the transport
+    is stopped or the track is silent, all values read ~0.0 (NOT an error;
+    poll while audio plays). MIDI tracks with no instrument read 0.0 too —
+    check `has_audio_output` in the result. Any field that raises on this
+    build comes back null with a sibling `<field>_error`.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_meter", {
+            "track_index": track_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error get_track_meter: {e}")
+        return f"Error get_track_meter: {e}"
 
 
 @mcp.tool()
