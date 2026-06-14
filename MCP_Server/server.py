@@ -92,9 +92,6 @@ class AbletonConnection:
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to Ableton and return the response"""
-        if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Ableton")
-        
         command = {
             "type": command_type,
             "params": params or {}
@@ -174,40 +171,42 @@ class AbletonConnection:
             "load_instrument_by_name",
         ]
         
+        payload = json.dumps(command).encode('utf-8')
+
+        # SEND with one reconnect+retry. A send-side failure means the command
+        # never reached Live, so retrying on a fresh socket is safe. We never
+        # retry once the bytes are on the wire (the command may have executed).
+        for send_attempt in range(2):
+            if not self.sock and not self.connect():
+                if send_attempt == 0:
+                    continue
+                raise ConnectionError("Not connected to Ableton")
+            try:
+                logger.info(f"Sending command: {command_type} with params: {params}")
+                self.sock.sendall(payload)
+                logger.info("Command sent, waiting for response...")
+                break
+            except (ConnectionError, BrokenPipeError, ConnectionResetError, OSError) as e:
+                logger.warning(f"Send of {command_type} failed ({e}); reconnecting + retrying")
+                self.sock = None
+                if send_attempt == 1:
+                    raise Exception(f"Connection to Ableton lost (send failed): {str(e)}")
+
+        # RECEIVE — the command is on the wire now; do NOT retry past this point.
+        response = None
         try:
-            logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
             # For state-modifying commands, add a small delay to give Ableton time to process
             if is_modifying_command:
                 import time
                 time.sleep(0.1)  # 100ms delay
-            
-            # Set timeout based on command type
+
             timeout = 15.0 if is_modifying_command else 10.0
             self.sock.settimeout(timeout)
-            
-            # Receive the response
+
             response_data = self.receive_full_response(self.sock)
             logger.info(f"Received {len(response_data)} bytes of data")
-            
-            # Parse the response
             response = json.loads(response_data.decode('utf-8'))
             logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
-            if response.get("status") == "error":
-                logger.error(f"Ableton error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Ableton"))
-            
-            # For state-modifying commands, add another small delay after receiving response
-            if is_modifying_command:
-                import time
-                time.sleep(0.1)  # 100ms delay
-            
-            return response.get("result", {})
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Ableton")
             self.sock = None
@@ -226,6 +225,17 @@ class AbletonConnection:
             logger.error(f"Error communicating with Ableton: {str(e)}")
             self.sock = None
             raise Exception(f"Communication error with Ableton: {str(e)}")
+
+        # A Live-SIDE error response is NOT a transport failure — keep the
+        # (healthy) socket open instead of churning a reconnect for every
+        # rejected command (the old code let this kill the socket).
+        if response.get("status") == "error":
+            logger.error(f"Ableton error: {response.get('message')}")
+            raise Exception(response.get("message", "Unknown error from Ableton"))
+        if is_modifying_command:
+            import time
+            time.sleep(0.1)  # 100ms delay
+        return response.get("result", {})
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
@@ -258,25 +268,58 @@ mcp = FastMCP(
 # Global connection for resources
 _ableton_connection = None
 
+
+def _is_socket_alive(sock) -> bool:
+    """Detect a dead / half-closed peer CHEAPLY without disturbing a live one.
+
+    The old health check `sock.sendall(b'')` was a no-op — sending zero bytes
+    transmits nothing on the wire, so a peer that closed (Live quit / Remote
+    Script reloaded) still 'passed', and you only discovered the dead socket
+    when a real command failed mid-session.
+
+    A non-blocking MSG_PEEK is the canonical detector:
+      - recv returns b''        -> peer sent FIN (closed cleanly) -> DEAD
+      - BlockingIOError          -> no data pending = healthy & idle -> ALIVE
+      - any other socket error   -> DEAD
+    It peeks (doesn't consume) so a live request/response stream is untouched.
+    """
+    if sock is None:
+        return False
+    try:
+        sock.setblocking(False)
+        try:
+            data = sock.recv(1, socket.MSG_PEEK)
+            return data != b''            # b'' == clean EOF -> dead
+        except BlockingIOError:
+            return True                   # nothing pending -> alive & idle
+        except (ConnectionError, OSError):
+            return False
+        finally:
+            try:
+                sock.setblocking(True)
+                sock.settimeout(15.0)
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
 def get_ableton_connection():
     """Get or create a persistent Ableton connection"""
     global _ableton_connection
-    
+
     if _ableton_connection is not None:
-        try:
-            # Test the connection with a simple ping
-            # We'll try to send an empty message, which should fail if the connection is dead
-            # but won't affect Ableton if it's alive
-            _ableton_connection.sock.settimeout(1.0)
-            _ableton_connection.sock.sendall(b'')
+        # Real health check (replaces the old no-op sendall(b'')): proactively
+        # detect a dead peer BEFORE issuing a command, so a Live restart leads to
+        # a clean reconnect instead of a mid-command "connection lost" error.
+        if _ableton_connection.sock is not None and _is_socket_alive(_ableton_connection.sock):
             return _ableton_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _ableton_connection.disconnect()
-            except:
-                pass
-            _ableton_connection = None
+        logger.warning("Existing Ableton connection is dead; reconnecting")
+        try:
+            _ableton_connection.disconnect()
+        except Exception:
+            pass
+        _ableton_connection = None
     
     # Connection doesn't exist or is invalid, create a new one
     if _ableton_connection is None:
@@ -308,10 +351,13 @@ def get_ableton_connection():
                     _ableton_connection.disconnect()
                     _ableton_connection = None
             
-            # Wait before trying again, but only if we have more attempts left
+            # Wait before trying again, but only if we have more attempts left.
+            # Exponential backoff + jitter so repeated reconnects don't hammer
+            # the socket in lockstep (and ride out a slow Live startup).
             if attempt < max_attempts:
-                import time
-                time.sleep(1.0)
+                import time, random
+                delay = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+                time.sleep(delay)
         
         # If we get here, all connection attempts failed
         if _ableton_connection is None:
