@@ -168,6 +168,10 @@ class AbletonConnection:
             "set_clip_markers",
             "set_session_automation_record",
             "set_exclusive_mode",
+            # Batch 2 (2026-06-14)
+            "set_crossfade_assign",
+            "store_rack_variation", "recall_rack_variation", "delete_rack_variation",
+            "load_instrument_by_name",
         ]
         
         try:
@@ -1142,6 +1146,39 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str) -> str:
         return f"Error loading instrument by URI: {str(e)}"
 
 @mcp.tool()
+def load_instrument_by_name(ctx: Context, name: str, track_index: int = -1,
+                            categories: str = "", max_results: int = 8) -> str:
+    """Find a Live browser device/preset by NAME (case-insensitive) and
+    optionally load the best match onto a track.
+
+    If track_index < 0, only returns ranked candidates (loads nothing).
+    Ambiguous names return the candidate list without loading. `categories` =
+    optional comma-separated browser roots to limit the search
+    (e.g. 'instruments,plugins'). Closes the "need the exact URI" friction —
+    say 'Drift' or 'warm pad' instead of a query: URI.
+    """
+    try:
+        ableton = get_ableton_connection()
+        cat_list = [c.strip() for c in categories.split(",") if c.strip()] or None
+        params = {"name": name, "categories": cat_list, "max_results": max_results}
+        if track_index is not None and track_index >= 0:
+            params["track_index"] = track_index
+        result = ableton.send_command("load_instrument_by_name", params)
+        if result.get("loaded"):
+            return (f"Loaded '{result.get('matched_name', name)}' on track "
+                    f"{track_index}. New devices: "
+                    f"{', '.join(result.get('new_devices', []))}")
+        cands = result.get("candidates", [])
+        if not cands:
+            return f"No browser item matches name '{name}'."
+        listing = "\n".join(f"  rank{c['rank']}  {c['name']}  ({c['path']})" for c in cands)
+        note = result.get("error") or result.get("message") or "Candidates:"
+        return f"{note}\n{listing}"
+    except Exception as e:
+        logger.error(f"Error in load_instrument_by_name: {str(e)}")
+        return f"Error in load_instrument_by_name: {str(e)}"
+
+@mcp.tool()
 def add_master_device(ctx: Context, uri: str) -> str:
     """
     Add an instrument or effect to the MASTER track via browser.
@@ -1865,6 +1902,67 @@ def get_rack_chains(
     except Exception as e:
         logger.error(f"Error getting rack chains: {str(e)}")
         return f"Error getting rack chains: {str(e)}"
+
+
+@mcp.tool()
+def get_rack_variations(ctx: Context, track_index: int, device_index: int) -> str:
+    """Read macro-VARIATION state of an Instrument/Audio-Effect Rack.
+
+    Returns {rack_name, supports_variations, variation_count,
+    selected_variation_index}. supports_variations=False if the device raised
+    on the variation getters (e.g. a plain device, not a rack with variations).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_rack_variations",
+            {"track_index": track_index, "device_index": device_index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting rack variations: {str(e)}")
+        return f"Error getting rack variations: {str(e)}"
+
+
+@mcp.tool()
+def store_rack_variation(ctx: Context, track_index: int, device_index: int) -> str:
+    """Snapshot a rack's current macro values as a NEW variation (appended and
+    auto-selected). Returns the new variation_count + selected_variation_index."""
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("store_rack_variation",
+            {"track_index": track_index, "device_index": device_index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error storing rack variation: {str(e)}")
+        return f"Error storing rack variation: {str(e)}"
+
+
+@mcp.tool()
+def recall_rack_variation(ctx: Context, track_index: int, device_index: int,
+                          index: int = None) -> str:
+    """Apply a stored macro variation. If `index` is given it is selected then
+    recalled; otherwise the currently-selected variation is recalled."""
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("recall_rack_variation",
+            {"track_index": track_index, "device_index": device_index, "index": index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error recalling rack variation: {str(e)}")
+        return f"Error recalling rack variation: {str(e)}"
+
+
+@mcp.tool()
+def delete_rack_variation(ctx: Context, track_index: int, device_index: int,
+                          index: int = None) -> str:
+    """Delete a stored macro variation (the given `index`, or the selected one)."""
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_rack_variation",
+            {"track_index": track_index, "device_index": device_index, "index": index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting rack variation: {str(e)}")
+        return f"Error deleting rack variation: {str(e)}"
 
 
 @mcp.tool()
@@ -4311,6 +4409,27 @@ def set_track_activator(
     except Exception as e:
         logger.error(f"Error set_track_activator: {e}")
         return f"Error set_track_activator: {e}"
+
+
+@mcp.tool()
+def set_crossfade_assign(ctx: Context, track_index: int, assign: int) -> str:
+    """Set a track's crossfader routing (Track.mixer_device.crossfade_assign).
+
+    Parameters:
+    - track_index: 0-based.
+    - assign: 0 = A (left of crossfader), 1 = None (unaffected/center),
+              2 = B (right of crossfader).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_crossfade_assign", {
+            "track_index": track_index,
+            "assign": assign,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error set_crossfade_assign: {e}")
+        return f"Error set_crossfade_assign: {e}"
 
 
 @mcp.tool()

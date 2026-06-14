@@ -323,6 +323,10 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_meter":
                 response["result"] = self._get_track_meter(
                     params.get("track_index", 0))
+            elif command_type == "get_rack_variations":
+                response["result"] = self._get_rack_variations(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0))
             # These commands must run on the main thread (writes + note reads)
             elif command_type in ["get_clip_notes",
                                  "create_midi_track", "set_track_name",
@@ -413,7 +417,12 @@ class AbletonMCP(ControlSurface):
                                  "set_clip_markers",
                                  "set_session_automation_record",
                                  "set_exclusive_mode",
-                                 "play_selection"]:
+                                 "play_selection",
+                                 # Batch 2 (2026-06-14)
+                                 "set_crossfade_assign",
+                                 "store_rack_variation", "recall_rack_variation",
+                                 "delete_rack_variation",
+                                 "load_instrument_by_name"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -962,6 +971,30 @@ class AbletonMCP(ControlSurface):
                                 params.get("exclusive_solo"))
                         elif command_type == "play_selection":
                             result = self._play_selection()
+                        elif command_type == "set_crossfade_assign":
+                            result = self._set_crossfade_assign(
+                                params.get("track_index", 0),
+                                params.get("assign", 1))
+                        elif command_type == "store_rack_variation":
+                            result = self._store_rack_variation(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0))
+                        elif command_type == "recall_rack_variation":
+                            result = self._recall_rack_variation(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("index"))
+                        elif command_type == "delete_rack_variation":
+                            result = self._delete_rack_variation(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("index"))
+                        elif command_type == "load_instrument_by_name":
+                            result = self._load_instrument_by_name(
+                                params.get("name", ""),
+                                params.get("track_index", None),
+                                params.get("categories", None),
+                                params.get("max_results", 8))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -3345,7 +3378,101 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error finding browser item by URI: {0}".format(str(e)))
             return None
-    
+
+    def _search_browser_items_by_name(self, name, categories=None, max_results=8):
+        """Recursive case-insensitive NAME walk over the browser tree, returning
+        RANKED loadable matches. READ-ONLY. Ranking: exact > startswith >
+        substring; ties by shorter name then shallower depth."""
+        app = self.application()
+        if not app or not hasattr(app, 'browser') or app.browser is None:
+            raise RuntimeError("Browser is not available in the Live application")
+        browser = app.browser
+        needle = (name or "").strip().lower()
+        if not needle:
+            raise ValueError("Empty search name")
+        roots = []
+        cats = categories or ('instruments', 'sounds', 'drums', 'audio_effects',
+                              'midi_effects', 'plugins', 'max_for_live', 'samples',
+                              'user_library', 'current_project', 'packs')
+        for c in cats:
+            try:
+                if hasattr(browser, c):
+                    roots.append((c, getattr(browser, c)))
+            except Exception as e:
+                self.log_message("Browser cat '{0}' raised: {1}".format(c, e))
+        matches = []
+
+        def visit(item, path, depth, max_depth=12):
+            if item is None or depth > max_depth:
+                return
+            try:
+                iname = item.name if hasattr(item, 'name') else None
+            except Exception:
+                iname = None
+            try:
+                loadable = bool(getattr(item, 'is_loadable', False))
+            except Exception:
+                loadable = False
+            if iname and loadable:
+                low = iname.lower()
+                rank = 0 if low == needle else (1 if low.startswith(needle) else (2 if needle in low else None))
+                if rank is not None:
+                    try:
+                        uri = item.uri if hasattr(item, 'uri') else None
+                    except Exception:
+                        uri = None
+                    matches.append({"name": iname, "uri": uri,
+                                    "path": "/".join(path + [iname]),
+                                    "rank": rank, "depth": depth})
+            try:
+                children = item.children if hasattr(item, 'children') else None
+            except Exception:
+                children = None
+            if children:
+                for child in children:
+                    visit(child, path + ([iname] if iname else []), depth + 1, max_depth)
+
+        for cat_name, root in roots:
+            visit(root, [cat_name], 0)
+        matches.sort(key=lambda m: (m["rank"], len(m["name"]), m["depth"], m["name"].lower()))
+        seen, deduped = set(), []
+        for m in matches:
+            key = m["uri"] or m["path"]
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(m)
+        return deduped[:max_results]
+
+    def _load_instrument_by_name(self, name, track_index=None,
+                                 categories=None, max_results=8):
+        """Find a browser item by NAME; load the best match onto a track if
+        unambiguous (WRITE when track_index is not None). Returns ranked
+        candidates when ambiguous or no track given."""
+        candidates = self._search_browser_items_by_name(name, categories, max_results)
+        if not candidates:
+            return {"loaded": False, "query": name, "candidates": [],
+                    "error": "No loadable browser item matches name '{0}'".format(name)}
+        best = candidates[0]
+        ambiguous = (len(candidates) > 1 and candidates[1]["rank"] == best["rank"]
+                     and candidates[1]["name"].lower() == best["name"].lower())
+        if track_index is None:
+            return {"loaded": False, "query": name, "candidates": candidates,
+                    "ambiguous": ambiguous,
+                    "message": "Name lookup only (no track_index)"}
+        if ambiguous:
+            return {"loaded": False, "query": name, "candidates": candidates,
+                    "ambiguous": True,
+                    "error": "Ambiguous name '{0}' — re-call with exact name or URI".format(name)}
+        if not best.get("uri"):
+            return {"loaded": False, "query": name, "candidates": candidates,
+                    "error": "Best match '{0}' has no URI".format(best["name"])}
+        load_result = self._load_browser_item(track_index, best["uri"])
+        load_result["query"] = name
+        load_result["matched_name"] = best["name"]
+        load_result["candidates"] = candidates
+        return load_result
+
     # Helper methods
     
     def _get_device_type(self, device):
@@ -3956,6 +4083,84 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting rack chains: " + str(e))
+            raise
+
+    def _get_rack_variations(self, track_index, device_index):
+        """Read RackDevice macro-variation state. Both fields guarded
+        individually — the getters can RAISE on racks/builds that don't
+        support variations, so report None+error rather than failing."""
+        try:
+            _, device = self._require_rack(track_index, device_index, "any")
+            result = {"track_index": track_index, "device_index": device_index,
+                      "rack_name": device.name, "supports_variations": True}
+            for field in ("variation_count", "selected_variation_index"):
+                try:
+                    result[field] = int(getattr(device, field))
+                except Exception as e:
+                    result[field] = None
+                    result[field + "_error"] = str(e)
+                    result["supports_variations"] = False
+            return result
+        except Exception as e:
+            self.log_message("Error get_rack_variations: " + str(e))
+            raise
+
+    def _store_rack_variation(self, track_index, device_index):
+        """store_variation() appends a NEW variation and selects it."""
+        try:
+            _, device = self._require_rack(track_index, device_index, "any")
+            if not hasattr(device, "store_variation"):
+                raise Exception("Rack '{0}' has no store_variation".format(device.name))
+            device.store_variation()
+            return {"track_index": track_index, "device_index": device_index,
+                    "variation_count": int(device.variation_count),
+                    "selected_variation_index": int(device.selected_variation_index)}
+        except Exception as e:
+            self.log_message("Error store_rack_variation: " + str(e))
+            raise
+
+    def _recall_rack_variation(self, track_index, device_index, index=None):
+        """Select index (if given), then recall_selected_variation()."""
+        try:
+            _, device = self._require_rack(track_index, device_index, "any")
+            if not hasattr(device, "recall_selected_variation"):
+                raise Exception("Rack '{0}' has no recall_selected_variation".format(device.name))
+            count = int(device.variation_count)
+            if count <= 0:
+                raise Exception("Rack has no stored variations to recall")
+            if index is not None:
+                idx = int(index)
+                if idx < 0 or idx >= count:
+                    raise IndexError("variation index {0} out of range 0..{1}".format(idx, count - 1))
+                device.selected_variation_index = idx
+            device.recall_selected_variation()
+            return {"track_index": track_index, "device_index": device_index,
+                    "recalled_index": int(device.selected_variation_index),
+                    "variation_count": int(device.variation_count)}
+        except Exception as e:
+            self.log_message("Error recall_rack_variation: " + str(e))
+            raise
+
+    def _delete_rack_variation(self, track_index, device_index, index=None):
+        """Select index (if given), then delete_selected_variation()."""
+        try:
+            _, device = self._require_rack(track_index, device_index, "any")
+            if not hasattr(device, "delete_selected_variation"):
+                raise Exception("Rack '{0}' has no delete_selected_variation".format(device.name))
+            count = int(device.variation_count)
+            if count <= 0:
+                raise Exception("Rack has no stored variations to delete")
+            if index is not None:
+                idx = int(index)
+                if idx < 0 or idx >= count:
+                    raise IndexError("variation index {0} out of range 0..{1}".format(idx, count - 1))
+                device.selected_variation_index = idx
+            device.delete_selected_variation()
+            return {"track_index": track_index, "device_index": device_index,
+                    "variation_count": int(device.variation_count),
+                    "selected_variation_index": int(device.selected_variation_index)}
+        except Exception as e:
+            self.log_message("Error delete_rack_variation: " + str(e))
             raise
 
     def _get_drum_pads(self, track_index, device_index, only_non_empty=True):
@@ -6660,6 +6865,40 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error set_track_activator: " + str(e))
+            raise
+
+    def _set_crossfade_assign(self, track_index, assign):
+        """Write Track.mixer_device.crossfade_assign (0=A, 1=None, 2=B).
+
+        BARE INT attribute (not a DeviceParameter) — assign directly, no
+        `.value`. Live's own ChannelStrip writes it the same way
+        (channel_strip.py:362).
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            mixer = getattr(track, "mixer_device", None)
+            if mixer is None or not hasattr(mixer, "crossfade_assign"):
+                raise Exception("Track has no mixer_device.crossfade_assign")
+            try:
+                a = int(assign)
+            except (TypeError, ValueError):
+                raise ValueError("assign must be int 0(=A)/1(=None)/2(=B)")
+            valid_max = 2
+            try:
+                vals = mixer.crossfade_assignments.values
+                if vals:
+                    valid_max = len(vals) - 1
+            except Exception:
+                pass  # crossfade_assignments may raise/be absent; fall back to 0..2
+            if a < 0 or a > valid_max:
+                raise ValueError("assign {0} out of range 0..{1}".format(a, valid_max))
+            mixer.crossfade_assign = a
+            return {"ok": True, "track_index": track_index,
+                    "assign": int(mixer.crossfade_assign)}
+        except Exception as e:
+            self.log_message("Error set_crossfade_assign: " + str(e))
             raise
 
     def _set_clip_markers(self, track_index, clip_index,
