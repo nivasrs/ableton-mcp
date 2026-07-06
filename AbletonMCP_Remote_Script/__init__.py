@@ -347,6 +347,7 @@ class AbletonMCP(ControlSurface):
                                  "jump_to_beat",
                                  # Clip envelope writes
                                  "set_clip_envelope_point", "set_clip_envelope_curve",
+                                 "duplicate_session_to_arrangement",
                                  "re_enable_automation",
                                  # Rack chain / drum pad writes
                                  "set_chain_state", "set_chain_mixer_value",
@@ -581,6 +582,12 @@ class AbletonMCP(ControlSurface):
                             value = params.get("value", False)
                             result = self._set_track_state(track_index, attribute, value)
                         # --- Tier 3 writes ---
+                        elif command_type == "duplicate_session_to_arrangement":
+                            track_index = params.get("track_index", 0)
+                            clip_index = params.get("clip_index", 0)
+                            destination_time = params.get("destination_time", 0.0)
+                            result = self._duplicate_session_to_arrangement(
+                                track_index, clip_index, destination_time)
                         elif command_type == "delete_arrangement_clip":
                             track_index = params.get("track_index", 0)
                             clip_index = params.get("clip_index", 0)
@@ -6122,6 +6129,41 @@ class AbletonMCP(ControlSurface):
     # loop-doubling. Six families wrapping LOM primitives surfaced by
     # the AbletonLive12_MIDIRemoteScripts survey workflow wb6doe9o9.
     # ----------------------------------------------------------------
+
+    def _duplicate_session_to_arrangement(self, track_index, clip_index,
+                                           destination_time):
+        """Losslessly place a SESSION clip onto the arrangement at destination_time
+        via Track.duplicate_clip_to_arrangement(session_clip, beat).
+
+        Native Live copy: notes, envelopes, warp, gain — everything travels.
+        Added 2026-07-05 after Live 12.4.2 broke the old-API note copy inside
+        _create_arrangement_clip_from_session (set_notes on arrangement clips
+        silently no-ops there; ears.py caught the resulting silent tiles).
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if not hasattr(track, "duplicate_clip_to_arrangement"):
+                raise NotImplementedError(
+                    "Track.duplicate_clip_to_arrangement not exposed on this Live build")
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Session clip slot out of range")
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise Exception("Session clip slot is empty")
+            new_clip = track.duplicate_clip_to_arrangement(
+                slot.clip, float(destination_time))
+            return {
+                "track_index": track_index,
+                "source_clip_index": clip_index,
+                "destination_time": float(destination_time),
+                "length": float(new_clip.length) if new_clip is not None else None,
+                "name": str(new_clip.name) if new_clip is not None else None,
+            }
+        except Exception as e:
+            self.log_message("Error duplicating session clip to arrangement: " + str(e))
+            raise
 
     def _duplicate_arrangement_clip(self, track_index, source_arrangement_clip_index,
                                      destination_time):
