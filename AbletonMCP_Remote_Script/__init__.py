@@ -423,7 +423,10 @@ class AbletonMCP(ControlSurface):
                                  "set_crossfade_assign",
                                  "store_rack_variation", "recall_rack_variation",
                                  "delete_rack_variation",
-                                 "load_instrument_by_name"]:
+                                 "load_instrument_by_name",
+                                 # Simpler slicing (2026-07-11) — completes the
+                                 # sliced-Simpler → Drum Rack native chain
+                                 "set_simpler_slicing", "get_simpler_slicing"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -516,6 +519,18 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             device_index = params.get("device_index", 0)
                             result = self._convert_sliced_simpler_to_drum_rack(track_index, device_index)
+                        elif command_type == "set_simpler_slicing":
+                            result = self._set_simpler_slicing(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("playback_mode"),
+                                params.get("slicing_style"),
+                                params.get("slicing_sensitivity"),
+                                params.get("slice_fracs"))
+                        elif command_type == "get_simpler_slicing":
+                            result = self._get_simpler_slicing(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0))
                         elif command_type == "set_device_parameter":
                             track_index = params.get("track_index", 0)
                             device_index = params.get("device_index", 0)
@@ -3327,17 +3342,130 @@ class AbletonMCP(ControlSurface):
             if device_index < 0 or device_index >= len(track.devices):
                 raise IndexError("Device index out of range on track '{0}'".format(track.name))
             device = track.devices[device_index]
+            # the conversion destroys the Simpler — its handle is dead after,
+            # so read everything we need from it first
+            device_name = device.name
             Live.Conversions.sliced_simpler_to_drum_rack(self._song, device)
+            track = self._song.tracks[track_index]
             return {
                 "converted": True,
                 "track": track.name,
-                "source_device": device.name,
+                "source_device": device_name,
                 "devices_after": [d.name for d in track.devices],
             }
         except Exception as e:
             self.log_message("Error in convert_sliced_simpler_to_drum_rack: {0}".format(str(e)))
             self.log_message(traceback.format_exc())
             raise
+
+    def _get_simpler_at(self, track_index, device_index):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index out of range on track '{0}'".format(track.name))
+        device = track.devices[device_index]
+        if device.class_name != "OriginalSimpler":
+            raise ValueError("Device '{0}' is {1}, not a Simpler".format(
+                device.name, device.class_name))
+        return device
+
+    def _set_simpler_slicing(self, track_index, device_index, playback_mode=None,
+                             slicing_style=None, slicing_sensitivity=None,
+                             slice_fracs=None):
+        """Configure a Simpler's slicing via LOM properties (NOT DeviceParameters).
+
+        playback_mode: 0=Classic 1=One-Shot 2=Slicing.
+        slice_fracs: manual slice points as FRACTIONS of sample length (0..1) —
+        callers never need Live's internal sample-frame units. Setting them
+        switches slicing_style to manual. Every setattr is guarded; the
+        response reports the actual post-state so the caller adjudicates.
+        """
+        try:
+            device = self._get_simpler_at(track_index, device_index)
+            warnings = []
+            if playback_mode is not None:
+                try:
+                    device.playback_mode = int(playback_mode)
+                except Exception as e:
+                    warnings.append("playback_mode: {0}".format(e))
+            sample = getattr(device, "sample", None)
+            if sample is None and (slicing_style is not None or
+                                   slicing_sensitivity is not None or slice_fracs):
+                raise ValueError("Simpler has no sample loaded")
+            if slicing_style is not None:
+                try:
+                    sample.slicing_style = int(slicing_style)
+                except Exception as e:
+                    warnings.append("slicing_style: {0}".format(e))
+            if slicing_sensitivity is not None:
+                try:
+                    sample.slicing_sensitivity = float(slicing_sensitivity)
+                except Exception as e:
+                    warnings.append("slicing_sensitivity: {0}".format(e))
+            if slice_fracs:
+                # manual style so inserted points are authoritative; probe the
+                # enum defensively (order differs across Live versions)
+                try:
+                    sample.slicing_style = 3
+                except Exception as e:
+                    warnings.append("manual slicing_style: {0}".format(e))
+                try:
+                    sample.clear_slices()
+                except Exception as e:
+                    warnings.append("clear_slices: {0}".format(e))
+                length = int(sample.length)
+                inserted = 0
+                for frac in slice_fracs:
+                    try:
+                        sample.insert_slice(int(max(0.0, min(0.999, float(frac))) * length))
+                        inserted += 1
+                    except Exception as e:
+                        warnings.append("insert_slice({0:.4f}): {1}".format(frac, e))
+                        break
+            return self._simpler_slicing_state(device, track_index, device_index,
+                                               warnings=warnings)
+        except Exception as e:
+            self.log_message("Error in set_simpler_slicing: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _get_simpler_slicing(self, track_index, device_index):
+        try:
+            device = self._get_simpler_at(track_index, device_index)
+            return self._simpler_slicing_state(device, track_index, device_index)
+        except Exception as e:
+            self.log_message("Error in get_simpler_slicing: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _simpler_slicing_state(self, device, track_index, device_index, warnings=None):
+        sample = getattr(device, "sample", None)
+        state = {
+            "track_index": track_index,
+            "device_index": device_index,
+            "playback_mode": getattr(device, "playback_mode", None),
+            "has_sample": sample is not None,
+        }
+        if sample is not None:
+            length = int(getattr(sample, "length", 0)) or 1
+            state["sample_length"] = length
+            for prop in ("slicing_style", "slicing_sensitivity",
+                         "slicing_beat_division", "slicing_region_count"):
+                try:
+                    state[prop] = getattr(sample, prop)
+                except Exception:
+                    state[prop] = None
+            try:
+                slices = list(sample.slices)
+                state["n_slices"] = len(slices)
+                state["slice_fracs"] = [round(s / float(length), 5) for s in slices]
+            except Exception as e:
+                state["n_slices"] = None
+                state["slices_error"] = str(e)
+        if warnings:
+            state["warnings"] = warnings
+        return state
 
     def _find_browser_item_by_uri(self, browser_or_item, uri, max_depth=10, current_depth=0):
         """Find a browser item by its URI"""

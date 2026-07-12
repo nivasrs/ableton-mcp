@@ -1452,6 +1452,67 @@ def convert_sliced_simpler_to_drum_rack(ctx: Context, track_index: int, device_i
 
 
 @mcp.tool()
+def set_simpler_slicing(ctx: Context, track_index: int, device_index: int,
+                        playback_mode: int = None, slicing_style: int = None,
+                        slicing_sensitivity: float = None,
+                        slice_fracs: list = None) -> str:
+    """
+    Configure a Simpler's slicing via LOM properties (2026-07-11).
+
+    This is the missing half of the native chop chain: put a Simpler into
+    Slicing mode, optionally with MANUAL slice points, then call
+    convert_sliced_simpler_to_drum_rack for per-slice pads.
+
+    Parameters:
+    - track_index / device_index: the Simpler (class_name 'OriginalSimpler')
+    - playback_mode: 0=Classic, 1=One-Shot, 2=Slicing
+    - slicing_style: sample slicing style enum (3 = manual; set automatically
+      when slice_fracs is given)
+    - slicing_sensitivity: 0..1 (transient style only)
+    - slice_fracs: manual slice points as FRACTIONS of sample length (0..1),
+      e.g. onset_time_s / duration_s — no sample-frame math needed
+
+    Returns the post-state (playback_mode, n_slices, warnings) — adjudicate
+    from that, not from hope.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {"track_index": track_index, "device_index": device_index}
+        if playback_mode is not None:
+            params["playback_mode"] = playback_mode
+        if slicing_style is not None:
+            params["slicing_style"] = slicing_style
+        if slicing_sensitivity is not None:
+            params["slicing_sensitivity"] = slicing_sensitivity
+        if slice_fracs is not None:
+            params["slice_fracs"] = slice_fracs
+        result = ableton.send_command("set_simpler_slicing", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in set_simpler_slicing: {e}")
+        return f"Error in set_simpler_slicing: {e}"
+
+
+@mcp.tool()
+def get_simpler_slicing(ctx: Context, track_index: int, device_index: int) -> str:
+    """
+    Read a Simpler's slicing state: playback_mode, sample presence/length,
+    slicing style/sensitivity, and current slice points as fractions of
+    sample length (slice_fracs).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_simpler_slicing", {
+            "track_index": track_index,
+            "device_index": device_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in get_simpler_slicing: {e}")
+        return f"Error in get_simpler_slicing: {e}"
+
+
+@mcp.tool()
 def fire_clip(ctx: Context, track_index: int, clip_index: int) -> str:
     """
     Start playing a clip.
